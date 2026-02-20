@@ -76,3 +76,6 @@ TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w200"
 
 # OMDB base URL
 OMDB_API_BASE = "https://www.omdbapi.com/"
+
+# Wikidata SPARQL endpoint (used to translate IMDB titles to Spanish)
+WIKIDATA_SPARQL_URL = "https://query.wikidata.org/sparql"
