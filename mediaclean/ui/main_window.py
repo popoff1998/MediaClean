@@ -18,9 +18,11 @@ from PySide6.QtWidgets import (
 )
 
 from mediaclean.scanner import EpisodeFile
+from mediaclean.scanner import guess_series_name_from_path
 from mediaclean.scanner import override_season
-from mediaclean.tmdb_client import TMDBClient, TMDBSeries
+from mediaclean.tmdb_client import TMDBSeries
 from mediaclean.omdb_client import OMDBClient
+from mediaclean.tvdb_client import TVDBClient
 from mediaclean.renamer import plan_renames, sanitize_filename
 from mediaclean.constants import DEFAULT_OUTPUT_FOLDER
 from mediaclean.ui.workers import ScanWorker, TMDBSearchWorker, TMDBLoadEpisodesWorker, RenameWorker
@@ -35,7 +37,7 @@ class MainWindow(QMainWindow):
 
         # State
         self.episodes: List[EpisodeFile] = []
-        self.tmdb_client: Optional[TMDBClient] = None
+        self.tmdb_client: Optional[object] = None
         self.tmdb_results: List[TMDBSeries] = []
         self.selected_series: Optional[TMDBSeries] = None
         self.source_folder: Optional[Path] = None
@@ -111,19 +113,19 @@ class MainWindow(QMainWindow):
         mode_row.addStretch()
         mode_layout.addLayout(mode_row)
 
-        # Stacked widget: page 0 = TMDB, page 1 = Manual
+        # Stacked widget: page 0 = búsqueda online, page 1 = Manual
         self.stack_mode = QStackedWidget()
 
-        # --- Page 0: TMDB / OMDB ---
+        # --- Page 0: TVDB / OMDB ---
         page_tmdb = QWidget()
         tmdb_layout = QGridLayout(page_tmdb)
         tmdb_layout.setContentsMargins(0, 4, 0, 0)
 
         tmdb_layout.addWidget(QLabel("Proveedor:"), 0, 0)
         self.cmb_provider = QComboBox()
-        self.cmb_provider.addItems(["TMDB", "OMDB"])
+        self.cmb_provider.addItems(["TVDB", "OMDB"])
         self.cmb_provider.setToolTip(
-            "TMDB: themoviedb.org (títulos en varios idiomas)\n"
+            "TVDB: TheTVDB v4 (series y episodios, con traducciones y temporadas)\n"
             "OMDB: omdbapi.com (más fácil de obtener API key, títulos en inglés)"
         )
         self.cmb_provider.currentIndexChanged.connect(self._on_provider_changed)
@@ -131,24 +133,31 @@ class MainWindow(QMainWindow):
 
         tmdb_layout.addWidget(QLabel("API Key:"), 1, 0)
         self.txt_api_key = QLineEdit()
-        self.txt_api_key.setPlaceholderText("Tu API key de TMDB (themoviedb.org)")
+        self.txt_api_key.setPlaceholderText("Tu API key de TVDB")
         self.txt_api_key.setEchoMode(QLineEdit.Password)
         tmdb_layout.addWidget(self.txt_api_key, 1, 1, 1, 2)
 
+        self.lbl_tvdb_pin = QLabel("PIN TVDB:")
+        tmdb_layout.addWidget(self.lbl_tvdb_pin, 2, 0)
+        self.txt_tvdb_pin = QLineEdit()
+        self.txt_tvdb_pin.setPlaceholderText("Opcional, si tu clave de TVDB lo requiere")
+        self.txt_tvdb_pin.setEchoMode(QLineEdit.Password)
+        tmdb_layout.addWidget(self.txt_tvdb_pin, 2, 1, 1, 2)
+
         self.lbl_language = QLabel("Idioma:")
-        tmdb_layout.addWidget(self.lbl_language, 2, 0)
+        tmdb_layout.addWidget(self.lbl_language, 3, 0)
         self.cmb_language = QComboBox()
         self.cmb_language.addItems(["es-ES", "en-US", "pt-BR", "fr-FR", "de-DE", "it-IT"])
-        tmdb_layout.addWidget(self.cmb_language, 2, 1)
+        tmdb_layout.addWidget(self.cmb_language, 3, 1)
 
-        tmdb_layout.addWidget(QLabel("Buscar serie:"), 3, 0)
+        tmdb_layout.addWidget(QLabel("Buscar serie:"), 4, 0)
         self.txt_search = QLineEdit()
         self.txt_search.setPlaceholderText("Nombre de la serie...")
         self.txt_search.returnPressed.connect(self._on_search_tmdb)
-        tmdb_layout.addWidget(self.txt_search, 3, 1)
+        tmdb_layout.addWidget(self.txt_search, 4, 1)
         self.btn_search = QPushButton("Buscar")
         self.btn_search.clicked.connect(self._on_search_tmdb)
-        tmdb_layout.addWidget(self.btn_search, 3, 2)
+        tmdb_layout.addWidget(self.btn_search, 4, 2)
 
         self.stack_mode.addWidget(page_tmdb)
 
@@ -172,7 +181,7 @@ class MainWindow(QMainWindow):
         mode_layout.addWidget(self.stack_mode)
         left_layout.addWidget(grp_mode)
 
-        # -- TMDB Results --
+        # -- Online results --
         self.grp_results = QGroupBox("3. Seleccionar serie")
         res_layout = QVBoxLayout(self.grp_results)
         self.list_results = QListWidget()
@@ -212,8 +221,9 @@ class MainWindow(QMainWindow):
         season_row = QHBoxLayout()
         self.chk_force_season = QCheckBox("Forzar temporada:")
         self.chk_force_season.setToolTip(
-            "Marca esta casilla para forzar la temporada de todos los episodios.\n"
-            "Útil cuando la detección automática no acierta."
+            "Marca esta casilla para aplicar la misma temporada a todos los episodios.\n"
+            "Útil cuando la detección automática no acierta en una carpeta de una sola temporada.\n"
+            "Déjala desactivada si el lote contiene varias temporadas."
         )
         self.chk_force_season.toggled.connect(self._on_force_season_toggled)
         season_row.addWidget(self.chk_force_season)
@@ -237,7 +247,7 @@ class MainWindow(QMainWindow):
         mode_file_row.addWidget(QLabel("Operación:"))
         self.rb_copy = QRadioButton("Copiar (conserva originales)")
         self.rb_move = QRadioButton("Mover (elimina originales)")
-        self.rb_copy.setChecked(True)
+        self.rb_move.setChecked(True)
         self.file_mode_group = QButtonGroup()
         self.file_mode_group.addButton(self.rb_copy, 0)
         self.file_mode_group.addButton(self.rb_move, 1)
@@ -330,14 +340,16 @@ class MainWindow(QMainWindow):
     # ──────────────────────────── SETTINGS ────────────────────────────
 
     def _load_settings(self):
-        provider = self.settings.value("api_provider", "TMDB")
+        provider = self.settings.value("api_provider", "TVDB")
+        if provider == "TMDB":
+            provider = "TVDB"
         idx_prov = self.cmb_provider.findText(provider)
         if idx_prov >= 0:
             self.cmb_provider.setCurrentIndex(idx_prov)
         # Ensure provider UI is synced (handles case where index didn't change)
         self._on_provider_changed(self.cmb_provider.currentIndex())
 
-        lang = self.settings.value("tmdb_language", "es-ES")
+        lang = self.settings.value("tvdb_language", self.settings.value("tmdb_language", "es-ES"))
         last_output = self.settings.value("last_output_dir", "")
         idx = self.cmb_language.findText(lang)
         if idx >= 0:
@@ -351,8 +363,9 @@ class MainWindow(QMainWindow):
         if provider == "OMDB":
             self.settings.setValue("omdb_api_key", self.txt_api_key.text().strip())
         else:
-            self.settings.setValue("tmdb_api_key", self.txt_api_key.text().strip())
-        self.settings.setValue("tmdb_language", self.cmb_language.currentText())
+            self.settings.setValue("tvdb_api_key", self.txt_api_key.text().strip())
+            self.settings.setValue("tvdb_pin", self.txt_tvdb_pin.text().strip())
+        self.settings.setValue("tvdb_language", self.cmb_language.currentText())
         if self.source_folder:
             self.settings.setValue("last_browse_dir", str(self.source_folder.parent))
         output_text = self.txt_output.text().strip()
@@ -424,9 +437,8 @@ class MainWindow(QMainWindow):
             self.btn_scan.setEnabled(True)
             # Save parent for next time
             self.settings.setValue("last_browse_dir", str(self.source_folder.parent))
-            # Auto-fill search / manual name with folder name guess
-            from mediaclean.scanner import guess_series_name
-            guess = guess_series_name(self.source_folder.name)
+            # Auto-fill search / manual name with an intelligent guess from the inner structure
+            guess = guess_series_name_from_path(self.source_folder)
             if guess:
                 self.txt_search.setText(guess)
                 self.txt_manual_name.setText(guess)
@@ -479,10 +491,23 @@ class MainWindow(QMainWindow):
             seasons = [ep.season for ep in episodes if ep.season is not None]
             if seasons:
                 from collections import Counter
+                unique_seasons = sorted(set(seasons))
                 dominant = Counter(seasons).most_common(1)[0][0]
                 self.spn_season.setValue(dominant)
-                self._log(f"Temporada detectada: <b>{dominant}</b> "
-                          f"(puedes cambiarla en Opciones o editar la tabla)")
+                if len(unique_seasons) == 1:
+                    self._log(f"Temporada detectada: <b>{dominant}</b> "
+                              f"(puedes cambiarla en Opciones o editar la tabla)")
+                else:
+                    seasons_text = ", ".join(f"T{s:02d}" for s in unique_seasons)
+                    self._log(
+                        "Temporadas detectadas automáticamente: "
+                        f"<b>{seasons_text}</b>"
+                    )
+                    self._log(
+                        "La carpeta parece contener varias temporadas. "
+                        "MediaClean mantendrá cada episodio en su temporada detectada "
+                        "mientras no actives 'Forzar temporada'."
+                    )
 
     def _on_scan_error(self, msg: str):
         self.btn_scan.setEnabled(True)
@@ -494,32 +519,42 @@ class MainWindow(QMainWindow):
         is_omdb = (self.cmb_provider.currentText() == "OMDB")
         # Save current key before switching
         current_key = self.txt_api_key.text().strip()
+        current_pin = self.txt_tvdb_pin.text().strip()
         if current_key:
             if is_omdb:
-                # Was TMDB, save its key
-                self.settings.setValue("tmdb_api_key", current_key)
+                self.settings.setValue("tvdb_api_key", current_key)
+                self.settings.setValue("tvdb_pin", current_pin)
             else:
-                # Was OMDB, save its key
                 self.settings.setValue("omdb_api_key", current_key)
 
         if is_omdb:
             self.txt_api_key.setPlaceholderText("Tu API key de OMDB (omdbapi.com/apikey.aspx)")
             stored_key = self.settings.value("omdb_api_key", "")
+            self.lbl_tvdb_pin.setVisible(False)
+            self.txt_tvdb_pin.setVisible(False)
             self.lbl_language.setVisible(False)
             self.cmb_language.setVisible(False)
         else:
-            self.txt_api_key.setPlaceholderText("Tu API key de TMDB (themoviedb.org)")
-            stored_key = self.settings.value("tmdb_api_key", "")
+            self.txt_api_key.setPlaceholderText("Tu API key de TVDB")
+            stored_key = self.settings.value("tvdb_api_key", self.settings.value("tmdb_api_key", ""))
+            stored_pin = self.settings.value("tvdb_pin", "")
+            self.lbl_tvdb_pin.setVisible(True)
+            self.txt_tvdb_pin.setVisible(True)
             self.lbl_language.setVisible(True)
             self.cmb_language.setVisible(True)
 
         self.txt_api_key.setText(stored_key if stored_key else "")
+        if is_omdb:
+            self.txt_tvdb_pin.setText("")
+        else:
+            self.txt_tvdb_pin.setText(stored_pin if stored_pin else "")
         # Reset client so it gets re-created with the right provider
         self.tmdb_client = None
 
     def _ensure_tmdb_client(self) -> bool:
         api_key = self.txt_api_key.text().strip()
         provider = self.cmb_provider.currentText()
+        tvdb_pin = self.txt_tvdb_pin.text().strip()
 
         if not api_key:
             if provider == "OMDB":
@@ -531,8 +566,8 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(
                     self, "API Key requerida",
-                    "Introduce tu API Key de TMDB.\n\n"
-                    "Puedes obtener una gratis en:\nhttps://www.themoviedb.org/settings/api"
+                    "Introduce tu API Key de TVDB.\n\n"
+                    "Si tu clave requiere PIN, complétalo también en el campo 'PIN TVDB'."
                 )
             return False
 
@@ -540,7 +575,7 @@ class MainWindow(QMainWindow):
         if provider == "OMDB":
             self.tmdb_client = OMDBClient(api_key, language=lang)
         else:
-            self.tmdb_client = TMDBClient(api_key, language=lang)
+            self.tmdb_client = TVDBClient(api_key, language=lang, pin=tvdb_pin)
         self._save_settings()
         return True
 
@@ -574,7 +609,10 @@ class MainWindow(QMainWindow):
 
         for s in results:
             year = s.first_air_date[:4] if s.first_air_date else "?"
-            item = QListWidgetItem(f"{s.name} ({year}) — {s.original_name}")
+            label = f"{s.name} ({year})"
+            if s.original_name and s.original_name != s.name:
+                label += f" — {s.original_name}"
+            item = QListWidgetItem(label)
             item.setData(Qt.UserRole, s.tmdb_id)
             self.list_results.addItem(item)
 
@@ -659,7 +697,8 @@ class MainWindow(QMainWindow):
         OMDB returns Amazon-hosted URLs like:
             …/MV5B…._V1_SX300.jpg
         We can replace the size suffix to get a tiny version.
-        TMDB URLs use path segments like /w200/ which we swap to /w92/.
+        TVDB usually returns full URLs. OMDB often returns Amazon-hosted images.
+        Legacy TMDB URLs still use path segments like /w200/ which we swap to /w92/.
         """
         if not url:
             return url
@@ -667,7 +706,7 @@ class MainWindow(QMainWindow):
         if "media-amazon.com" in url or "_V1_" in url:
             import re
             url = re.sub(r'_V1_.*\.jpg', '_V1_SX100.jpg', url)
-        # TMDB: use smallest profile
+        # Legacy TMDB URLs: use smallest profile
         elif "/w200/" in url:
             url = url.replace("/w200/", "/w92/")
         return url
@@ -728,7 +767,7 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.information(
                     self, "Faltan datos",
-                    "Selecciona una serie de TMDB o cambia a modo manual."
+                    "Selecciona una serie online o cambia a modo manual."
                 )
                 return
 
@@ -736,7 +775,7 @@ class MainWindow(QMainWindow):
         plan_renames(self.episodes, self.selected_series, output_base)
         self._update_table()
         self.btn_execute.setEnabled(True)
-        self._log("Previsualización generada. Revisa los nombres y pulsa 'Ejecutar' para copiar.")
+        self._log("Previsualización generada. Revisa los nombres y pulsa 'Ejecutar' para procesar los archivos.")
         self.statusBar().showMessage("Previsualización lista")
 
     def _on_execute(self):

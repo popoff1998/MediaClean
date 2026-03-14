@@ -59,6 +59,9 @@ EPISODE_PATTERNS = [
     # Standalone "E01" not preceded by S/T/season marker
     r"(?<![SsTt\d])[Ee](\d{2,3})(?=[\s._\-\[\(]|$)",
 
+    # Leading bare episode number: "01 - Pilot", "401", "1205"
+    r"^(\d{1,4})(?=[\s._\-\[\(]|$)",
+
     # Bare episode number after a separator: "- 01", "- 001"
     r"[\-–—]\s*(\d{2,4})(?=[\s._\[\(]|$)",
 
@@ -69,6 +72,9 @@ EPISODE_PATTERNS = [
 
 # Default output folder name
 DEFAULT_OUTPUT_FOLDER = "_MediaClean_Output"
+
+# TVDB base URL
+TVDB_API_BASE = "https://api4.thetvdb.com/v4"
 
 # TMDB base URLs
 TMDB_API_BASE = "https://api.themoviedb.org/3"

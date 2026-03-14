@@ -1,16 +1,16 @@
 """
-Worker threads for long-running operations (scanning, TMDB lookup, file copy, poster download).
+Worker threads for long-running operations (scanning, metadata lookup, file copy, poster download).
 """
 
 import urllib.request
 import urllib.error
 from PySide6.QtCore import QThread, Signal
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from mediaclean.scanner import scan_folder, EpisodeFile
-from mediaclean.tmdb_client import TMDBClient, TMDBSeries, TMDBError
-from mediaclean.renamer import plan_renames, execute_renames
+from mediaclean.tmdb_client import TMDBSeries
+from mediaclean.renamer import execute_renames
 
 
 class ScanWorker(QThread):
@@ -31,11 +31,11 @@ class ScanWorker(QThread):
 
 
 class TMDBSearchWorker(QThread):
-    """Searches TMDB for a series in a background thread."""
+    """Searches the configured online provider for a series in a background thread."""
     finished = Signal(list)   # List[TMDBSeries]
     error = Signal(str)
 
-    def __init__(self, client: TMDBClient, query: str, parent=None):
+    def __init__(self, client: Any, query: str, parent=None):
         super().__init__(parent)
         self.client = client
         self.query = query
@@ -44,18 +44,16 @@ class TMDBSearchWorker(QThread):
         try:
             results = self.client.search_series(self.query)
             self.finished.emit(results)
-        except TMDBError as e:
-            self.error.emit(str(e))
         except Exception as e:
             self.error.emit(str(e))
 
 
 class TMDBLoadEpisodesWorker(QThread):
-    """Loads episode metadata for a series from TMDB."""
+    """Loads episode metadata for a series from the configured provider."""
     finished = Signal(object)  # TMDBSeries with episodes populated
     error = Signal(str)
 
-    def __init__(self, client: TMDBClient, series: TMDBSeries,
+    def __init__(self, client: Any, series: TMDBSeries,
                  seasons: Optional[List[int]] = None, parent=None):
         super().__init__(parent)
         self.client = client
@@ -66,8 +64,6 @@ class TMDBLoadEpisodesWorker(QThread):
         try:
             self.client.load_episodes_for_series(self.series, self.seasons)
             self.finished.emit(self.series)
-        except TMDBError as e:
-            self.error.emit(str(e))
         except Exception as e:
             self.error.emit(str(e))
 
@@ -78,7 +74,7 @@ class RenameWorker(QThread):
     finished = Signal(list)       # List[str] log messages
     error = Signal(str)
 
-    def __init__(self, episodes: List[EpisodeFile], file_mode: str = "copy", parent=None):
+    def __init__(self, episodes: List[EpisodeFile], file_mode: str = "move", parent=None):
         super().__init__(parent)
         self.episodes = episodes
         self.file_mode = file_mode

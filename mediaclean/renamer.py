@@ -15,6 +15,7 @@ Output structure:
                 ...
 """
 
+import importlib
 import os
 import re
 import shutil
@@ -89,7 +90,7 @@ def plan_renames(
 
 def execute_renames(
     episodes: List[EpisodeFile],
-    file_mode: str = "copy",
+    file_mode: str = "move",
     progress_callback=None,
 ) -> List[str]:
     """
@@ -161,7 +162,7 @@ def _extract_video_from_rar(rar_path: Path, output_dir: Path) -> Optional[Path]:
     """
     # ── Method 1: rarfile module ──
     try:
-        import rarfile
+        rarfile = importlib.import_module("rarfile")
         with rarfile.RarFile(str(rar_path)) as rf:
             for info in rf.infolist():
                 ext = Path(info.filename).suffix.lower()

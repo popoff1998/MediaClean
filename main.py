@@ -1,6 +1,6 @@
 """
 MediaClean — Entry point.
-Organiza tus descargas de series para Plex usando TMDB.
+Organiza tus descargas de series para Plex usando TVDB u OMDB.
 """
 
 import sys
