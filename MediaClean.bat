@@ -2,6 +2,12 @@
 title MediaClean
 cd /d "%~dp0"
 
+:: Prefer local virtual environment when available
+if exist "%~dp0.venv\Scripts\python.exe" (
+    "%~dp0.venv\Scripts\python.exe" main.py
+    goto :end
+)
+
 :: Try python, then python3, then py launcher
 where python >nul 2>&1
 if %errorlevel%==0 (

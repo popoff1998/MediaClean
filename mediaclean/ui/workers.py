@@ -13,6 +13,14 @@ from mediaclean.tmdb_client import TMDBSeries
 from mediaclean.renamer import execute_renames
 
 
+def _format_worker_error(operation: str, exc: Exception) -> str:
+    """Return a stable, readable error message for background workers."""
+    msg = str(exc).strip()
+    if msg:
+        return f"{operation}: {exc.__class__.__name__}: {msg}"
+    return f"{operation}: {exc.__class__.__name__}"
+
+
 class ScanWorker(QThread):
     """Scans a folder for video files in a background thread."""
     finished = Signal(list)  # List[EpisodeFile]
@@ -27,7 +35,7 @@ class ScanWorker(QThread):
             episodes = scan_folder(self.folder_path)
             self.finished.emit(episodes)
         except Exception as e:
-            self.error.emit(str(e))
+            self.error.emit(_format_worker_error("Error during scan", e))
 
 
 class TMDBSearchWorker(QThread):
@@ -45,7 +53,7 @@ class TMDBSearchWorker(QThread):
             results = self.client.search_series(self.query)
             self.finished.emit(results)
         except Exception as e:
-            self.error.emit(str(e))
+            self.error.emit(_format_worker_error("Error during search", e))
 
 
 class TMDBLoadEpisodesWorker(QThread):
@@ -65,7 +73,7 @@ class TMDBLoadEpisodesWorker(QThread):
             self.client.load_episodes_for_series(self.series, self.seasons)
             self.finished.emit(self.series)
         except Exception as e:
-            self.error.emit(str(e))
+            self.error.emit(_format_worker_error("Error loading episodes", e))
 
 
 class RenameWorker(QThread):
@@ -74,21 +82,29 @@ class RenameWorker(QThread):
     finished = Signal(list)       # List[str] log messages
     error = Signal(str)
 
-    def __init__(self, episodes: List[EpisodeFile], file_mode: str = "move", parent=None):
+    def __init__(
+        self,
+        episodes: List[EpisodeFile],
+        file_mode: str = "move",
+        source_root: Optional[Path] = None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.episodes = episodes
         self.file_mode = file_mode
+        self.source_root = source_root
 
     def run(self):
         try:
             log = execute_renames(
                 self.episodes,
                 file_mode=self.file_mode,
+                source_root=self.source_root,
                 progress_callback=lambda cur, tot: self.progress.emit(cur, tot),
             )
             self.finished.emit(log)
         except Exception as e:
-            self.error.emit(str(e))
+            self.error.emit(_format_worker_error("Error processing files", e))
 
 
 class PosterWorker(QThread):
@@ -108,6 +124,6 @@ class PosterWorker(QThread):
                 data = resp.read()
             self.finished.emit(data)
         except (urllib.error.HTTPError, urllib.error.URLError) as e:
-            self.error.emit(str(e))
+            self.error.emit(_format_worker_error("Error downloading poster", e))
         except Exception as e:
-            self.error.emit(str(e))
+            self.error.emit(_format_worker_error("Error downloading poster", e))

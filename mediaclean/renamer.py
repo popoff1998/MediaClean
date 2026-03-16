@@ -24,7 +24,7 @@ import tempfile
 from pathlib import Path
 from typing import List, Optional
 
-from mediaclean.scanner import EpisodeFile
+from mediaclean.scanner import EpisodeFile, parse_episode_info
 from mediaclean.tmdb_client import TMDBSeries
 from mediaclean.constants import DEFAULT_OUTPUT_FOLDER, VIDEO_EXTENSIONS
 
@@ -91,6 +91,7 @@ def plan_renames(
 def execute_renames(
     episodes: List[EpisodeFile],
     file_mode: str = "move",
+    source_root: Optional[Path] = None,
     progress_callback=None,
 ) -> List[str]:
     """
@@ -101,80 +102,148 @@ def execute_renames(
       - copy: files are duplicated (originals untouched)
       - move: files are moved (originals disappear from source)
 
+        source_root:
+            - folder selected by the user; never removed by auto-cleanup.
+
     Episodes with needs_extract=True are extracted from RAR first.
     """
     log: List[str] = []
     total = len([e for e in episodes if e.new_path])
+    processed = 0
+    archive_remaining: dict[Path, List[Path]] = {}
+    archive_temp_dirs: dict[Path, tempfile.TemporaryDirectory] = {}
+    pending_per_container: dict[Path, int] = {}
+    failed_containers: set[Path] = set()
 
-    for idx, ep in enumerate(episodes):
-        if ep.new_path is None:
-            log.append(f"SKIP: {ep.original_path.name} (no season/episode info)")
-            continue
+    if file_mode == "move":
+        for ep in episodes:
+            container = ep.original_path.parent
+            if ep.new_path is None:
+                # Keep folders with skipped items so they remain visible for manual fixing.
+                failed_containers.add(container)
+                continue
+            pending_per_container[container] = pending_per_container.get(container, 0) + 1
 
-        # Create target directory
-        ep.new_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        for ep in episodes:
+            if ep.new_path is None:
+                log.append(f"SKIP: {ep.original_path.name} (no season/episode info)")
+                continue
 
-        try:
-            if ep.needs_extract:
-                # ── Extract from RAR ──
-                extracted = _extract_video_from_rar(ep.original_path, ep.new_path.parent)
-                if extracted is None:
-                    log.append(f"ERROR: {ep.original_path.name}  -->  no video found in RAR")
-                    continue
-                # Update extension if it was guessed wrong during scan
-                real_ext = extracted.suffix.lower()
-                if real_ext != ep.extension:
-                    ep.extension = real_ext
-                    ep.new_name = ep.new_name.rsplit(".", 1)[0] + real_ext
-                    ep.new_path = ep.new_path.parent / ep.new_name
-                # Move extracted file to final name
-                final_target = ep.new_path
-                if extracted != final_target:
-                    if final_target.exists():
-                        final_target.unlink()
-                    shutil.move(str(extracted), str(final_target))
-                log.append(f"EXTRACT: {ep.original_path.name}  -->  {ep.new_name}")
-            elif file_mode == "move":
-                shutil.move(str(ep.original_path), str(ep.new_path))
-                log.append(f"MOVE: {ep.original_path.name}  -->  {ep.new_name}")
-            else:
-                shutil.copy2(str(ep.original_path), str(ep.new_path))
-                log.append(f"COPY: {ep.original_path.name}  -->  {ep.new_name}")
-        except Exception as e:
-            log.append(f"ERROR: {ep.original_path.name}  -->  {e}")
+            processed += 1
+            success = False
+            container = ep.original_path.parent
 
-        if progress_callback:
-            progress_callback(idx + 1, total)
+            source_desc = ep.original_path.name
+            if ep.archive_member:
+                source_desc = f"{source_desc}:{Path(ep.archive_member).name}"
+
+            try:
+                # Create target directory for this file only.
+                ep.new_path.parent.mkdir(parents=True, exist_ok=True)
+
+                if ep.needs_extract:
+                    if ep.original_path not in archive_remaining:
+                        tmp_dir = tempfile.TemporaryDirectory(prefix="mediaclean_rar_")
+                        archive_temp_dirs[ep.original_path] = tmp_dir
+                        archive_remaining[ep.original_path] = _extract_videos_from_rar(
+                            ep.original_path,
+                            Path(tmp_dir.name),
+                        )
+
+                    extracted = _pick_extracted_video(archive_remaining[ep.original_path], ep)
+                    if extracted is None:
+                        log.append(f"ERROR: {source_desc}  -->  no video found in RAR")
+                    else:
+                        # Update extension if it was guessed wrong during scan
+                        real_ext = extracted.suffix.lower()
+                        if real_ext != ep.extension:
+                            ep.extension = real_ext
+                            base_name = ep.new_name.rsplit(".", 1)[0] if ep.new_name else ep.new_path.stem
+                            ep.new_name = base_name + real_ext
+                            ep.new_path = ep.new_path.parent / ep.new_name
+
+                        final_target = ep.new_path
+                        if final_target.exists():
+                            final_target.unlink()
+                        shutil.move(str(extracted), str(final_target))
+                        log.append(f"EXTRACT: {source_desc}  -->  {ep.new_name}")
+                        success = True
+
+                elif file_mode == "move":
+                    shutil.move(str(ep.original_path), str(ep.new_path))
+                    log.append(f"MOVE: {ep.original_path.name}  -->  {ep.new_name}")
+                    success = True
+                else:
+                    shutil.copy2(str(ep.original_path), str(ep.new_path))
+                    log.append(f"COPY: {ep.original_path.name}  -->  {ep.new_name}")
+                    success = True
+            except Exception as e:
+                msg = str(e).strip()
+                detail = f"{e.__class__.__name__}: {msg}" if msg else e.__class__.__name__
+                log.append(f"ERROR: {source_desc}  -->  {detail}")
+                failed_containers.add(container)
+            finally:
+                if file_mode == "move":
+                    if success:
+                        remaining = max(pending_per_container.get(container, 0) - 1, 0)
+                        pending_per_container[container] = remaining
+                        if remaining == 0 and container not in failed_containers:
+                            if source_root is None or not _is_same_path(container, source_root):
+                                _remove_source_container(container, log)
+                    else:
+                        failed_containers.add(container)
+
+                if progress_callback:
+                    try:
+                        progress_callback(processed, total)
+                    except Exception:
+                        # Never abort the processing loop because of UI callback failures.
+                        pass
+    finally:
+        for temp_dir in archive_temp_dirs.values():
+            try:
+                temp_dir.cleanup()
+            except Exception as e:
+                msg = str(e).strip()
+                detail = f"{e.__class__.__name__}: {msg}" if msg else e.__class__.__name__
+                log.append(f"WARN: failed to clean temporary extraction folder ({detail})")
 
     return log
 
 
-def _extract_video_from_rar(rar_path: Path, output_dir: Path) -> Optional[Path]:
+def _extract_videos_from_rar(rar_path: Path, output_dir: Path) -> List[Path]:
     """
-    Extract the video file from a RAR archive into output_dir.
+    Extract all video files from a RAR archive into output_dir.
     Tries multiple extraction methods:
       1. rarfile (pure Python, needs UnRAR DLL/binary)
       2. unrar command-line
       3. 7z command-line (7-Zip)
       4. WinRAR directly
 
-    Returns the Path of the extracted video or None.
+    Returns extracted videos sorted by filename.
     """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     # ── Method 1: rarfile module ──
     try:
         rarfile = importlib.import_module("rarfile")
+        extracted_any = False
         with rarfile.RarFile(str(rar_path)) as rf:
             for info in rf.infolist():
-                ext = Path(info.filename).suffix.lower()
+                member = str(info.filename)
+                if not member or member.endswith(("/", "\\")):
+                    continue
+
+                ext = Path(member).suffix.lower()
                 if ext in VIDEO_EXTENSIONS:
                     rf.extract(info, str(output_dir))
-                    extracted = output_dir / info.filename
-                    # If extracted into a subfolder, move it up
-                    if extracted.parent != output_dir:
-                        dest = output_dir / extracted.name
-                        shutil.move(str(extracted), str(dest))
-                        extracted = dest
-                    return extracted
+                    extracted_any = True
+
+        if extracted_any:
+            videos = _collect_video_files(output_dir)
+            if videos:
+                return videos
     except ImportError:
         pass  # rarfile not installed
     except Exception:
@@ -190,13 +259,43 @@ def _extract_video_from_rar(rar_path: Path, output_dir: Path) -> Optional[Path]:
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             if result.returncode == 0:
-                video = _find_video_in_dir(output_dir)
-                if video:
-                    return video
+                videos = _collect_video_files(output_dir)
+                if videos:
+                    return videos
         except (FileNotFoundError, subprocess.TimeoutExpired):
             continue
 
-    return None
+    return []
+
+
+def _pick_extracted_video(remaining: List[Path], ep: EpisodeFile) -> Optional[Path]:
+    """
+    Select the best extracted file for one episode and remove it from
+    the remaining pool to avoid duplicate assignment.
+    """
+    if not remaining:
+        return None
+
+    # 1) Prefer exact basename match when we know the archive member.
+    if ep.archive_member:
+        wanted = Path(ep.archive_member).name.lower()
+        for idx, candidate in enumerate(remaining):
+            if candidate.name.lower() == wanted:
+                return remaining.pop(idx)
+
+    # 2) Try matching by parsed season/episode from extracted filename.
+    if ep.season is not None and ep.episode is not None:
+        for idx, candidate in enumerate(remaining):
+            cand_season, cand_episode = parse_episode_info(candidate.name)
+            if cand_episode is None:
+                continue
+            if cand_season is None:
+                cand_season = ep.season
+            if cand_season == ep.season and cand_episode == ep.episode:
+                return remaining.pop(idx)
+
+    # 3) Fallback: consume in deterministic order.
+    return remaining.pop(0)
 
 
 def _build_extract_commands(rar_path: Path, output_dir: Path):
@@ -219,9 +318,38 @@ def _build_extract_commands(rar_path: Path, output_dir: Path):
     return commands
 
 
-def _find_video_in_dir(directory: Path) -> Optional[Path]:
-    """Find the first video file in a directory (non-recursive)."""
-    for f in sorted(directory.iterdir()):
-        if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS:
-            return f
-    return None
+def _collect_video_files(directory: Path) -> List[Path]:
+    """Collect extracted video files recursively in deterministic order."""
+    videos: List[Path] = []
+    for path in sorted(directory.rglob("*"), key=lambda p: str(p).lower()):
+        if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS:
+            videos.append(path)
+    return videos
+
+
+def _remove_source_container(container: Path, log: List[str]):
+    """Remove a source container folder after all its files were moved successfully."""
+    if not container.exists() or not container.is_dir():
+        return
+
+    try:
+        shutil.rmtree(container)
+        log.append(f"CLEANUP: {container}")
+    except Exception as e:
+        msg = str(e).strip()
+        detail = f"{e.__class__.__name__}: {msg}" if msg else e.__class__.__name__
+        log.append(f"WARN: failed to remove source folder {container} ({detail})")
+
+
+def _is_same_path(a: Path, b: Path) -> bool:
+    """Compare two paths robustly across relative forms and Windows case-insensitivity."""
+    return _path_key(a) == _path_key(b)
+
+
+def _path_key(path: Path) -> str:
+    """Normalised key for path comparisons."""
+    try:
+        normalized = path.resolve(strict=False)
+    except Exception:
+        normalized = path.absolute()
+    return os.path.normcase(os.path.normpath(str(normalized)))

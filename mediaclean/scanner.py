@@ -90,6 +90,7 @@ class EpisodeFile:
     new_name: Optional[str] = None
     new_path: Optional[Path] = None
     needs_extract: bool = False  # True if source is a RAR archive
+    archive_member: Optional[str] = None  # Internal member path for multi-video RARs
 
     def __post_init__(self):
         self.extension = self.original_path.suffix.lower()
@@ -140,6 +141,77 @@ def _find_rar_video_extension(rar_path: Path) -> str:
         pass
     # Default guess — will be corrected after extraction
     return ".mkv"
+
+
+def _list_rar_video_members(rar_path: Path) -> List[str]:
+    """
+    List video entries found inside a RAR archive.
+
+    Returns member paths as stored inside the archive.
+    If archive listing is unavailable (e.g. rarfile not installed),
+    returns an empty list.
+    """
+    members: List[str] = []
+    seen: set[str] = set()
+
+    try:
+        rarfile = importlib.import_module("rarfile")
+        with rarfile.RarFile(str(rar_path)) as rf:
+            for info in rf.infolist():
+                member = str(info.filename)
+                if not member or member.endswith(("/", "\\")):
+                    continue
+
+                ext = Path(member).suffix.lower()
+                if ext not in VIDEO_EXTENSIONS:
+                    continue
+
+                key = member.replace("\\", "/").lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                members.append(member)
+    except Exception:
+        return []
+
+    return members
+
+
+def _parse_episode_range(text: str) -> List[Tuple[Optional[int], int]]:
+    """
+    Parse compact ranges like "Cap.101_107" or "E01-07".
+
+    Returns a list of (season, episode) tuples.
+    Season can be None when it cannot be inferred from the range itself.
+    """
+    patterns = [
+        r"[Cc]ap(?:[ií]tulo)?[\s._-]*(\d{1,4})\s*[_\-]\s*(\d{1,4})",
+        r"[Ee](?:p(?:isodio|isode)?)[\s._-]*(\d{1,4})\s*[_\-]\s*(\d{1,4})",
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if not m:
+            continue
+
+        start_raw, end_raw = m.group(1), m.group(2)
+        start_season, start_episode = _fuzzy_parse_cap_number(start_raw)
+        end_season, end_episode = _fuzzy_parse_cap_number(end_raw)
+
+        if start_episode is None or end_episode is None:
+            continue
+        if end_episode < start_episode:
+            continue
+        if (end_episode - start_episode) > 200:
+            continue
+
+        season = start_season if start_season is not None else end_season
+        if start_season is not None and end_season is not None and start_season != end_season:
+            continue
+
+        return [(season, ep) for ep in range(start_episode, end_episode + 1)]
+
+    return []
 
 
 def parse_episode_info(filename: str) -> Tuple[Optional[int], Optional[int]]:
@@ -255,6 +327,16 @@ def _fuzzy_parse_cap_number(raw_num: str) -> Tuple[Optional[int], Optional[int]]
     return None, None
 
 
+def _strip_trailing_unbalanced_brackets(text: str) -> str:
+    """Remove dangling suffixes that start with an unclosed bracket."""
+    cleaned = text
+    while True:
+        updated = re.sub(r"\s*[\[\(\{][^\]\)\}]*$", "", cleaned).strip(" -–—._")
+        if updated == cleaned:
+            return updated
+        cleaned = updated
+
+
 def guess_series_name(folder_name: str) -> str:
     """
     Try to extract a clean series name from a folder name by stripping
@@ -280,11 +362,14 @@ def guess_series_name(folder_name: str) -> str:
     for pattern in JUNK_PATTERNS:
         name = re.sub(pattern, "", name, flags=re.IGNORECASE)
 
+    # Remove trailing fragments such as "Show Name [1080p".
+    name = _strip_trailing_unbalanced_brackets(name)
+
     # Replace dots, underscores with spaces
     name = name.replace(".", " ").replace("_", " ")
 
     # Remove extra whitespace and trailing dashes
-    name = re.sub(r"\s+", " ", name).strip(" -–—")
+    name = re.sub(r"\s+", " ", name).strip(" -–—[](){}")
 
     return name
 
@@ -376,15 +461,17 @@ def _series_candidate_from_text(raw_text: str) -> str:
     if not candidate:
         return ""
 
-    candidate = re.sub(r"\s+", " ", candidate).strip(" -–—._")
-    candidate = re.sub(r"\b(19[5-9]\d|20[0-3]\d)$", "", candidate).strip(" -–—._")
+    candidate = re.sub(r"\s+", " ", candidate).strip(" -–—._[](){}")
+    candidate = _strip_trailing_unbalanced_brackets(candidate)
+    candidate = re.sub(r"\b(19[5-9]\d|20[0-3]\d)$", "", candidate).strip(" -–—._[](){}")
 
     words = candidate.split()
     while words and _series_name_key(words[0]) in GENERIC_CONTAINER_HINTS:
         words.pop(0)
     while words and _series_name_key(words[-1]) in GENERIC_CONTAINER_HINTS:
         words.pop()
-    candidate = " ".join(words).strip(" -–—._")
+    candidate = " ".join(words).strip(" -–—._[](){}")
+    candidate = _strip_trailing_unbalanced_brackets(candidate)
 
     if not _is_valid_series_candidate(candidate):
         return ""
@@ -441,7 +528,7 @@ def scan_folder(root_path: Path) -> List[EpisodeFile]:
 
     for dirpath, dirnames, filenames in os.walk(root_path):
         dir_has_video = False
-        dir_rar_first = None  # first RAR volume in this directory
+        dir_rar_first_volumes: List[Path] = []
 
         for fname in filenames:
             fpath = Path(dirpath) / fname
@@ -462,34 +549,88 @@ def scan_folder(root_path: Path) -> List[EpisodeFile]:
                 ep.episode = episode
                 episodes.append(ep)
 
-            elif dir_rar_first is None and is_rar_first_volume(fpath):
-                dir_rar_first = fpath
+            elif is_rar_first_volume(fpath):
+                dir_rar_first_volumes.append(fpath)
 
-        # If this directory has RAR files but NO video files, treat the
-        # RAR as a compressed episode
-        if not dir_has_video and dir_rar_first is not None:
-            # Try to determine the video extension inside the archive
-            vid_ext = _find_rar_video_extension(dir_rar_first)
+        # If this directory has RAR files but NO video files, treat each
+        # first RAR volume as a compressed episode.
+        if not dir_has_video and dir_rar_first_volumes:
+            for rar_file in sorted(dir_rar_first_volumes, key=lambda p: p.name.lower()):
+                members = _list_rar_video_members(rar_file)
 
-            ep = EpisodeFile(
-                original_path=dir_rar_first,
-                series_guess=series_guess,
-                needs_extract=True,
-            )
-            ep.extension = vid_ext  # override the .rar extension
+                # Best case: archive listing is available and contains
+                # one or more video files. Create one EpisodeFile per member.
+                if members:
+                    for member in members:
+                        member_name = Path(member).name
+                        member_ext = Path(member).suffix.lower() or _find_rar_video_extension(rar_file)
 
-            # Parse episode info from the RAR filename or folder
-            season, episode = parse_episode_info(dir_rar_first.name)
-            if season is None:
-                season = _extract_season_from_string(dir_rar_first.stem)
-            if season is None and episode is None:
-                season, episode = parse_episode_info(dir_rar_first.parent.name)
+                        ep = EpisodeFile(
+                            original_path=rar_file,
+                            series_guess=series_guess,
+                            needs_extract=True,
+                            archive_member=member,
+                        )
+                        ep.extension = member_ext
+
+                        # Prefer episode parsing from the member filename.
+                        season, episode = parse_episode_info(member_name)
+                        if season is None:
+                            season = _extract_season_from_string(member_name)
+
+                        # Fallback to archive filename or parent folder.
+                        if season is None and episode is None:
+                            season, episode = parse_episode_info(rar_file.name)
+                            if season is None:
+                                season = _extract_season_from_string(rar_file.stem)
+                        if season is None and episode is None:
+                            season, episode = parse_episode_info(rar_file.parent.name)
+                            if season is None:
+                                season = _extract_season_from_string(rar_file.parent.name)
+
+                        ep.season = season
+                        ep.episode = episode
+                        episodes.append(ep)
+                    continue
+
+                # Fallback when archive listing is unavailable (e.g. rarfile
+                # not installed): expand compact ranges from archive filename.
+                range_items = _parse_episode_range(rar_file.stem)
+                if range_items:
+                    vid_ext = _find_rar_video_extension(rar_file)
+                    for season, episode in range_items:
+                        ep = EpisodeFile(
+                            original_path=rar_file,
+                            series_guess=series_guess,
+                            needs_extract=True,
+                        )
+                        ep.extension = vid_ext
+                        ep.season = season
+                        ep.episode = episode
+                        episodes.append(ep)
+                    continue
+
+                # Last resort: treat archive as a single unknown/partially
+                # known episode.
+                vid_ext = _find_rar_video_extension(rar_file)
+                ep = EpisodeFile(
+                    original_path=rar_file,
+                    series_guess=series_guess,
+                    needs_extract=True,
+                )
+                ep.extension = vid_ext
+
+                season, episode = parse_episode_info(rar_file.name)
                 if season is None:
-                    season = _extract_season_from_string(dir_rar_first.parent.name)
+                    season = _extract_season_from_string(rar_file.stem)
+                if season is None and episode is None:
+                    season, episode = parse_episode_info(rar_file.parent.name)
+                    if season is None:
+                        season = _extract_season_from_string(rar_file.parent.name)
 
-            ep.season = season
-            ep.episode = episode
-            episodes.append(ep)
+                ep.season = season
+                ep.episode = episode
+                episodes.append(ep)
 
     # Post-process: try to infer seasons for episodes that have None
     infer_seasons(episodes, root_path)

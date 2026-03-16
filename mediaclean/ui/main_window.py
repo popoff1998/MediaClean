@@ -817,6 +817,7 @@ class MainWindow(QMainWindow):
         self._rename_worker = RenameWorker(
             self.episodes,
             file_mode=file_mode,
+            source_root=self.source_folder,
         )
         self._rename_worker.progress.connect(self._on_progress)
         self._rename_worker.finished.connect(self._on_execute_finished)
@@ -827,30 +828,52 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(current)
 
     def _on_execute_finished(self, log_messages: list):
-        for msg in log_messages:
+        logs = list(log_messages or [])
+        error_count = 0
+
+        for raw_msg in logs:
+            msg = str(raw_msg)
             if msg.startswith("ERROR"):
+                error_count += 1
                 self._log_error(msg)
+            elif msg.startswith("WARN"):
+                self._log(f'<span style="color:#f9e2af;">{msg}</span>')
             elif msg.startswith("SKIP"):
                 self._log(f'<span style="color:#fab387;">{msg}</span>')
             else:
                 self._log_success(msg)
 
         self.progress_bar.setValue(self.progress_bar.maximum())
+        self.progress_bar.setVisible(False)
+        self.btn_execute.setEnabled(True)
         self.btn_scan.setEnabled(True)
         self.btn_preview.setEnabled(True)
-        self.statusBar().showMessage("¡Proceso completado!")
-        self._log_success("═══ Proceso completado con éxito ═══")
+        self._rename_worker = None
 
-        QMessageBox.information(
-            self, "Completado",
-            "Los archivos se han organizado correctamente.\n"
-            "Ya puedes mover la carpeta de salida a tu biblioteca de Plex."
-        )
+        if error_count:
+            self.statusBar().showMessage(f"Proceso completado con {error_count} error(es)")
+            self._log_error(f"═══ Proceso completado con {error_count} error(es) ═══")
+            QMessageBox.warning(
+                self, "Completado con errores",
+                "Algunos archivos no se pudieron procesar.\n"
+                "Revisa el log para ver el detalle de cada error."
+            )
+        else:
+            self.statusBar().showMessage("¡Proceso completado!")
+            self._log_success("═══ Proceso completado con éxito ═══")
+            QMessageBox.information(
+                self, "Completado",
+                "Los archivos se han organizado correctamente.\n"
+                "Ya puedes mover la carpeta de salida a tu biblioteca de Plex."
+            )
 
     def _on_execute_error(self, msg: str):
         self._log_error(msg)
         self.btn_execute.setEnabled(True)
         self.btn_scan.setEnabled(True)
+        self.btn_preview.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self._rename_worker = None
         self.statusBar().showMessage("Error durante el procesamiento")
 
     # ──────────────────────────── HELPERS ────────────────────────────
@@ -928,10 +951,15 @@ class MainWindow(QMainWindow):
             label = ep.original_path.name
             if ep.needs_extract:
                 label = f"📦 {label}"
+                if ep.archive_member:
+                    label = f"{label} :: {Path(ep.archive_member).name}"
             item_orig = QTableWidgetItem(label)
             item_orig.setFlags(item_orig.flags() & ~Qt.ItemIsEditable)
             if ep.needs_extract:
-                item_orig.setToolTip("Archivo comprimido (RAR) — se extraerá automáticamente")
+                tooltip = "Archivo comprimido (RAR) — se extraerá automáticamente"
+                if ep.archive_member:
+                    tooltip += f"\nContenido detectado: {ep.archive_member}"
+                item_orig.setToolTip(tooltip)
             self.table.setItem(row, 0, item_orig)
 
             # Season (EDITABLE)
