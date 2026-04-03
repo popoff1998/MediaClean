@@ -658,16 +658,28 @@ class MainWindow(QMainWindow):
 
         # Determine which seasons we need
         seasons_needed = set()
+        requested_episodes = {}
         for ep in self.episodes:
             if ep.season is not None:
                 seasons_needed.add(ep.season)
+                if ep.episode is not None:
+                    requested_episodes.setdefault(ep.season, set()).add(ep.episode)
         if not seasons_needed:
             seasons_needed = None  # Load all
+            requested_episodes = None
         else:
             seasons_needed = sorted(seasons_needed)
+            requested_episodes = {
+                season: sorted(episodes)
+                for season, episodes in requested_episodes.items()
+                if episodes
+            }
 
         self._load_worker = TMDBLoadEpisodesWorker(
-            self.tmdb_client, self.selected_series, seasons_needed
+            self.tmdb_client,
+            self.selected_series,
+            seasons_needed,
+            requested_episodes,
         )
         self._load_worker.finished.connect(self._on_episodes_loaded)
         self._load_worker.error.connect(self._on_episodes_load_error)

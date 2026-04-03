@@ -6,7 +6,7 @@ import urllib.request
 import urllib.error
 from PySide6.QtCore import QThread, Signal
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from mediaclean.scanner import scan_folder, EpisodeFile
 from mediaclean.tmdb_client import TMDBSeries
@@ -62,15 +62,22 @@ class TMDBLoadEpisodesWorker(QThread):
     error = Signal(str)
 
     def __init__(self, client: Any, series: TMDBSeries,
-                 seasons: Optional[List[int]] = None, parent=None):
+                 seasons: Optional[List[int]] = None,
+                 requested_episodes: Optional[Dict[int, List[int]]] = None,
+                 parent=None):
         super().__init__(parent)
         self.client = client
         self.series = series
         self.seasons = seasons
+        self.requested_episodes = requested_episodes
 
     def run(self):
         try:
-            self.client.load_episodes_for_series(self.series, self.seasons)
+            self.client.load_episodes_for_series(
+                self.series,
+                self.seasons,
+                self.requested_episodes,
+            )
             self.finished.emit(self.series)
         except Exception as e:
             self.error.emit(_format_worker_error("Error loading episodes", e))
