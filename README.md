@@ -8,12 +8,18 @@ Cuando se usa OMDB (que solo devuelve títulos en inglés), MediaClean consulta 
 
 - **Escaneo inteligente**: Detecta archivos de vídeo (`.mkv`, `.avi`, `.mp4`, `.mov`, etc.) dentro de estructuras de carpetas complejas e intenta deducir la serie desde carpetas y ficheros internos, no solo desde la carpeta contenedora.
 - **Carpetas multi-temporada**: Puede procesar un lote que incluya varias temporadas de la misma serie y enviar cada episodio a su `Season XX` correcta.
+- **Modo de lote configurable**: Soporta `Serie única` (flujo clásico) y `Múltiples series` con agrupación automática por afinidad de rutas/nombres.
+- **Asignación por grupo**: En modo múltiple puedes asignar cada grupo detectado a una serie distinta en TVDB/OMDB o por nombre manual.
+- **Sugerencias con confianza**: En modo `Serie única` muestra sugerencias visuales basadas en ficheros con porcentaje de confianza.
+- **Navegación de pendientes**: En modo `Múltiples series`, botón `Siguiente sin asignar` para saltar al próximo grupo que aún no tiene serie.
 - **Detección de episodios**: Extrae temporada y número de episodio de nombres de archivo con patrones como `S01E01`, `1x01`, `Capitulo 01`, etc.
 - **Integración TVDB / OMDB**: Busca la serie en TheTVDB o en Open Movie Database y obtiene los títulos oficiales de cada episodio.
 - **Traducción vía Wikidata**: Cuando se usa OMDB (solo inglés), los títulos se traducen automáticamente al castellano consultando Wikidata (SPARQL, propiedad `P345`).
 - **Renombrado Plex**: Genera nombres compatibles con Plex: `Serie - S01E01 - Título del Episodio.mkv`
 - **Mover o copiar**: Por defecto mueve los archivos a una carpeta de salida limpia, pero puedes cambiar la operación a copia si prefieres conservar los originales en su ubicación inicial.
 - **Hard links opcionales**: Ahorra espacio en disco creando hard links en lugar de copias (mismo disco necesario).
+- **Dry-run seguro**: Incluye modo simulación estricto sin copiar/mover archivos para validar antes de la ejecución real.
+- **Reporte CSV**: Exporta un informe final con origen, destino, serie asignada y estado (OK, ERROR, SKIP, DRY-RUN).
 - **Interfaz moderna**: GUI con tema oscuro estilo Catppuccin.
 
 ## Requisitos
@@ -48,10 +54,11 @@ python main.py
 
 1. **Seleccionar carpeta**: Pulsa "Explorar…" y selecciona la carpeta raíz de la serie descargada.
 2. **Escanear**: Pulsa "Escanear carpeta" para detectar los archivos de vídeo.
-3. **Configurar API**: Introduce tu API Key (TVDB u OMDB) y busca el nombre de la serie.
-4. **Seleccionar**: Haz clic en la serie correcta de la lista de resultados.
-5. **Previsualizar**: Revisa en la tabla cómo se renombrarán los archivos.
-6. **Ejecutar**: Pulsa "Ejecutar" para crear la carpeta de salida con los vídeos renombrados.
+3. **Elegir modo de lote**: `Serie única` para un solo título o `Múltiples series` para agrupar y asignar varias series en el mismo lote.
+4. **Configurar API**: Introduce tu API Key (TVDB u OMDB) y busca la serie.
+5. **Asignar serie(s)**: En modo único eliges una serie; en modo múltiple seleccionas cada grupo detectado y le asignas su serie.
+6. **Previsualizar**: Revisa en la tabla cómo se renombrarán los archivos.
+7. **Ejecutar**: Pulsa "Ejecutar" para crear la carpeta de salida con los vídeos renombrados.
 
 ### Estructura de salida
 

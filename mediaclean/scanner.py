@@ -510,6 +510,65 @@ def _looks_like_generic_container(name: str) -> bool:
     return all(word in GENERIC_CONTAINER_HINTS for word in words)
 
 
+def _guess_series_name_for_file(file_path: Path, root_path: Path, fallback: str) -> str:
+    """
+    Guess a series name for a concrete file path using local folder affinity.
+
+    This is used by multi-series mode to keep episodes grouped by the most
+    representative nearby folder names instead of forcing one global guess.
+    """
+    scores: Counter[str] = Counter()
+    display_names: dict[str, str] = {}
+
+    def remember(raw_text: str, weight: int):
+        candidate = _series_candidate_from_text(raw_text)
+        if not candidate:
+            return
+        key = _series_name_key(candidate)
+        if not key:
+            return
+        scores[key] += max(weight, 1)
+        best_display = display_names.get(key, "")
+        if len(candidate) > len(best_display):
+            display_names[key] = candidate
+
+    file_candidate = _series_candidate_from_text(file_path.stem)
+    if file_candidate:
+        # File stem should dominate when multiple shows are mixed in one folder.
+        remember(file_candidate, 12)
+
+    current = file_path.parent
+    depth = 0
+    while True:
+        folder_name = current.name
+        folder_weight = max(8 - depth * 2, 2)
+
+        if current == root_path and file_candidate:
+            # In flat mixed folders, the root label is often generic/noisy.
+            folder_weight = min(folder_weight, 2)
+
+        if _extract_season_from_string(folder_name) is not None:
+            # "Season 01" contributes less than a real series folder.
+            folder_weight = max(folder_weight - 3, 1)
+        remember(folder_name, folder_weight)
+
+        if current == root_path or current == current.parent:
+            break
+        current = current.parent
+        depth += 1
+
+    remember(file_path.stem, 6)
+
+    if scores:
+        best_key, _ = max(
+            scores.items(),
+            key=lambda item: (item[1], len(display_names.get(item[0], ""))),
+        )
+        return display_names[best_key]
+
+    return fallback
+
+
 def scan_folder(root_path: Path) -> List[EpisodeFile]:
     """
     Scan a series root folder and discover all video files,
@@ -524,7 +583,7 @@ def scan_folder(root_path: Path) -> List[EpisodeFile]:
     if not root_path.is_dir():
         return episodes
 
-    series_guess = guess_series_name_from_path(root_path)
+    default_series_guess = guess_series_name_from_path(root_path)
 
     for dirpath, dirnames, filenames in os.walk(root_path):
         dir_has_video = False
@@ -534,6 +593,7 @@ def scan_folder(root_path: Path) -> List[EpisodeFile]:
             fpath = Path(dirpath) / fname
             if is_video_file(fpath):
                 dir_has_video = True
+                series_guess = _guess_series_name_for_file(fpath, root_path, default_series_guess)
                 ep = EpisodeFile(original_path=fpath, series_guess=series_guess)
 
                 season, episode = parse_episode_info(fname)
@@ -567,7 +627,7 @@ def scan_folder(root_path: Path) -> List[EpisodeFile]:
 
                         ep = EpisodeFile(
                             original_path=rar_file,
-                            series_guess=series_guess,
+                            series_guess=_guess_series_name_for_file(rar_file, root_path, default_series_guess),
                             needs_extract=True,
                             archive_member=member,
                         )
@@ -601,7 +661,7 @@ def scan_folder(root_path: Path) -> List[EpisodeFile]:
                     for season, episode in range_items:
                         ep = EpisodeFile(
                             original_path=rar_file,
-                            series_guess=series_guess,
+                            series_guess=_guess_series_name_for_file(rar_file, root_path, default_series_guess),
                             needs_extract=True,
                         )
                         ep.extension = vid_ext
@@ -615,7 +675,7 @@ def scan_folder(root_path: Path) -> List[EpisodeFile]:
                 vid_ext = _find_rar_video_extension(rar_file)
                 ep = EpisodeFile(
                     original_path=rar_file,
-                    series_guess=series_guess,
+                    series_guess=_guess_series_name_for_file(rar_file, root_path, default_series_guess),
                     needs_extract=True,
                 )
                 ep.extension = vid_ext

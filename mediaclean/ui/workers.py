@@ -73,11 +73,19 @@ class TMDBLoadEpisodesWorker(QThread):
 
     def run(self):
         try:
-            self.client.load_episodes_for_series(
-                self.series,
-                self.seasons,
-                self.requested_episodes,
-            )
+            try:
+                self.client.load_episodes_for_series(
+                    self.series,
+                    self.seasons,
+                    self.requested_episodes,
+                )
+            except TypeError:
+                # Backward-compatible path for providers that only accept
+                # (series, seasons).
+                self.client.load_episodes_for_series(
+                    self.series,
+                    self.seasons,
+                )
             self.finished.emit(self.series)
         except Exception as e:
             self.error.emit(_format_worker_error("Error loading episodes", e))

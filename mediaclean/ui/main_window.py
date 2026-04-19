@@ -3,11 +3,14 @@ Main window for MediaClean application.
 """
 
 import json
+import re
+import csv
+from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from PySide6.QtCore import Qt, QSettings
-from PySide6.QtGui import QIcon, QFont, QPixmap
+from PySide6.QtGui import QIcon, QFont, QPixmap, QColor
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QGroupBox, QPushButton, QLabel, QLineEdit, QFileDialog,
@@ -41,6 +44,14 @@ class MainWindow(QMainWindow):
         self.tmdb_results: List[TMDBSeries] = []
         self.selected_series: Optional[TMDBSeries] = None
         self.source_folder: Optional[Path] = None
+        self.series_assignments: Dict[str, TMDBSeries] = {}
+        self.series_assignment_type: Dict[str, str] = {}
+        self.episode_groups: Dict[str, List[EpisodeFile]] = {}
+        self.group_labels: Dict[str, str] = {}
+        self.single_mode_suggestions: List[str] = []
+        self.single_mode_suggestion_scores: Dict[str, int] = {}
+        self.active_group_key: Optional[str] = None
+        self._pending_assignment_group: Optional[str] = None
 
         # Workers (keep references to avoid GC)
         self._scan_worker = None
@@ -48,6 +59,9 @@ class MainWindow(QMainWindow):
         self._load_worker = None
         self._rename_worker = None
         self._poster_worker = None
+        self._active_poster_workers: List[object] = []
+        self._poster_request_seq = 0
+        self._last_poster_url = ""
 
         # Settings
         self.settings = QSettings("MediaClean", "MediaClean")
@@ -97,7 +111,21 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(grp_source)
 
         # -- Mode selector --
-        grp_mode = QGroupBox("2. Identificar serie")
+        grp_batch_mode = QGroupBox("2. Tipo de lote")
+        batch_mode_layout = QHBoxLayout(grp_batch_mode)
+        self.rb_single_batch = QRadioButton("Serie única")
+        self.rb_multi_batch = QRadioButton("Múltiples series")
+        self.rb_single_batch.setChecked(True)
+        self.batch_mode_group = QButtonGroup()
+        self.batch_mode_group.addButton(self.rb_single_batch, 0)
+        self.batch_mode_group.addButton(self.rb_multi_batch, 1)
+        self.batch_mode_group.idToggled.connect(self._on_batch_mode_changed)
+        batch_mode_layout.addWidget(self.rb_single_batch)
+        batch_mode_layout.addWidget(self.rb_multi_batch)
+        batch_mode_layout.addStretch()
+        left_layout.addWidget(grp_batch_mode)
+
+        grp_mode = QGroupBox("3. Identificar serie")
         mode_layout = QVBoxLayout(grp_mode)
 
         mode_row = QHBoxLayout()
@@ -112,6 +140,21 @@ class MainWindow(QMainWindow):
         mode_row.addWidget(self.rb_manual)
         mode_row.addStretch()
         mode_layout.addLayout(mode_row)
+
+        suggestion_row = QHBoxLayout()
+        self.lbl_single_suggestion = QLabel("Sugerencia detectada:")
+        self.cmb_single_suggestion = QComboBox()
+        self.cmb_single_suggestion.setToolTip(
+            "Sugerencias inferidas por el nombre de los ficheros detectados."
+        )
+        self.cmb_single_suggestion.currentIndexChanged.connect(self._on_single_suggestion_changed)
+        self.btn_use_single_suggestion = QPushButton("Usar")
+        self.btn_use_single_suggestion.setFixedWidth(70)
+        self.btn_use_single_suggestion.clicked.connect(self._on_use_single_suggestion)
+        suggestion_row.addWidget(self.lbl_single_suggestion)
+        suggestion_row.addWidget(self.cmb_single_suggestion, stretch=1)
+        suggestion_row.addWidget(self.btn_use_single_suggestion)
+        mode_layout.addLayout(suggestion_row)
 
         # Stacked widget: page 0 = búsqueda online, page 1 = Manual
         self.stack_mode = QStackedWidget()
@@ -184,8 +227,31 @@ class MainWindow(QMainWindow):
         # -- Online results --
         self.grp_results = QGroupBox("3. Seleccionar serie")
         res_layout = QVBoxLayout(self.grp_results)
+
+        group_row = QHBoxLayout()
+        self.lbl_series_group = QLabel("Grupo detectado:")
+        self.cmb_series_group = QComboBox()
+        self.cmb_series_group.currentIndexChanged.connect(self._on_series_group_changed)
+        self.btn_next_unassigned = QPushButton("Siguiente sin asignar")
+        self.btn_next_unassigned.setToolTip(
+            "Ir al siguiente grupo que aún no esté confirmado online (TVDB/OMDB).\n"
+            "Estados: ✓ confirmada online, ~ asignación manual, sin marca = provisional."
+        )
+        self.btn_next_unassigned.setShortcut("Ctrl+J")
+        self.btn_next_unassigned.clicked.connect(self._on_next_unassigned_group)
+        self.lbl_group_summary = QLabel("")
+        self.lbl_group_summary.setToolTip("Resumen de grupos: online, manual y pendientes de confirmar online")
+        group_row.addWidget(self.lbl_series_group)
+        group_row.addWidget(self.cmb_series_group, stretch=1)
+        group_row.addWidget(self.btn_next_unassigned)
+        group_row.addWidget(self.lbl_group_summary)
+        res_layout.addLayout(group_row)
+
         self.list_results = QListWidget()
+        self.list_results.setMouseTracking(True)
+        self.list_results.viewport().setMouseTracking(True)
         self.list_results.itemClicked.connect(self._on_series_selected)
+        self.list_results.itemEntered.connect(self._on_series_hovered)
         res_layout.addWidget(self.list_results)
 
         # Series info row: poster thumbnail + text
@@ -214,7 +280,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.grp_results)
 
         # -- Options --
-        grp_options = QGroupBox("4. Opciones")
+        grp_options = QGroupBox("5. Opciones")
         opt_layout = QVBoxLayout(grp_options)
 
         # Season override
@@ -256,6 +322,20 @@ class MainWindow(QMainWindow):
         mode_file_row.addStretch()
         opt_layout.addLayout(mode_file_row)
 
+        self.chk_dry_run = QCheckBox("Modo simulación (dry-run, sin copiar/mover)")
+        self.chk_dry_run.setToolTip(
+            "Valida y muestra la operación final, pero no modifica archivos.\n"
+            "Recomendado para una primera prueba real."
+        )
+        opt_layout.addWidget(self.chk_dry_run)
+
+        self.chk_export_report = QCheckBox("Exportar reporte CSV al finalizar")
+        self.chk_export_report.setChecked(True)
+        self.chk_export_report.setToolTip(
+            "Genera un CSV con origen, destino, serie asignada y estado final."
+        )
+        opt_layout.addWidget(self.chk_export_report)
+
         out_row = QHBoxLayout()
         out_row.addWidget(QLabel("Carpeta de salida:"))
         self.txt_output = QLineEdit()
@@ -282,12 +362,12 @@ class MainWindow(QMainWindow):
         preview_layout = QVBoxLayout(grp_preview)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(5)
+        self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels([
-            "Archivo original", "Temporada", "Episodio", "Título episodio", "Nuevo nombre"
+            "Archivo original", "Temporada", "Episodio", "Título episodio", "Serie asignada", "Nuevo nombre"
         ])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         # Allow editing only season (col 1) and episode (col 2)
@@ -336,6 +416,13 @@ class MainWindow(QMainWindow):
 
         # Status bar
         self.statusBar().showMessage("Listo")
+        self.lbl_series_group.setVisible(False)
+        self.cmb_series_group.setVisible(False)
+        self.btn_next_unassigned.setVisible(False)
+        self.lbl_group_summary.setVisible(False)
+        self.lbl_single_suggestion.setVisible(False)
+        self.cmb_single_suggestion.setVisible(False)
+        self.btn_use_single_suggestion.setVisible(False)
 
     # ──────────────────────────── SETTINGS ────────────────────────────
 
@@ -403,6 +490,297 @@ class MainWindow(QMainWindow):
             self.info_frame.setVisible(False)
             self.list_results.clear()
 
+    def _on_batch_mode_changed(self, button_id: int, checked: bool):
+        """Toggle between single-series and multi-series batch modes."""
+        if not checked:
+            return
+
+        is_multi = (button_id == 1)
+        self._refresh_group_selector(keep_current=True)
+
+        if not is_multi:
+            self.active_group_key = None
+            self._refresh_single_suggestion_selector(keep_current=True)
+            self._apply_single_mode_suggestion()
+        else:
+            if self.episode_groups and self.active_group_key is None:
+                self.active_group_key = next(iter(self.episode_groups.keys()))
+            self._sync_inputs_with_active_group()
+            self._refresh_single_suggestion_selector(keep_current=True)
+
+        self.btn_execute.setEnabled(False)
+
+    @staticmethod
+    def _group_key(name: str) -> str:
+        normalized = re.sub(r"\s+", " ", name.strip())
+        normalized = re.sub(r"[^A-Za-zÀ-ÿ0-9 ]+", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip().lower()
+        return normalized or "serie-desconocida"
+
+    def _build_episode_groups(self):
+        self.episode_groups = {}
+        self.group_labels = {}
+
+        for ep in self.episodes:
+            label = ep.series_guess.strip() if ep.series_guess.strip() else "Serie desconocida"
+            key = self._group_key(label)
+            if key not in self.group_labels:
+                self.group_labels[key] = label
+            self.episode_groups.setdefault(key, []).append(ep)
+
+        ordered_keys = sorted(self.episode_groups.keys(), key=lambda k: self.group_labels.get(k, "").lower())
+        self.episode_groups = {key: self.episode_groups[key] for key in ordered_keys}
+
+        if self.active_group_key not in self.episode_groups:
+            self.active_group_key = ordered_keys[0] if ordered_keys else None
+
+        self._build_single_mode_suggestions()
+
+    def _build_single_mode_suggestions(self):
+        suggestions: List[str] = []
+        scores: Dict[str, int] = {}
+        if self.episode_groups:
+            total = max(sum(len(items) for items in self.episode_groups.values()), 1)
+            ordered = sorted(
+                self.episode_groups.keys(),
+                key=lambda key: (-len(self.episode_groups[key]), self.group_labels.get(key, "").lower()),
+            )
+            for key in ordered:
+                label = self.group_labels.get(key, "").strip()
+                if label and label not in suggestions:
+                    suggestions.append(label)
+                    score = int(round((len(self.episode_groups[key]) / total) * 100))
+                    scores[label] = max(1, min(score, 100))
+
+        if not suggestions and self.source_folder:
+            fallback = guess_series_name_from_path(self.source_folder).strip()
+            if fallback:
+                suggestions.append(fallback)
+                scores[fallback] = 100
+
+        self.single_mode_suggestions = suggestions
+        self.single_mode_suggestion_scores = scores
+        self._refresh_single_suggestion_selector(keep_current=True)
+
+    def _refresh_single_suggestion_selector(self, keep_current: bool = False):
+        current = self.cmb_single_suggestion.currentData(Qt.UserRole) if keep_current else ""
+        self.cmb_single_suggestion.blockSignals(True)
+        self.cmb_single_suggestion.clear()
+
+        for name in self.single_mode_suggestions:
+            score = self.single_mode_suggestion_scores.get(name)
+            if score is None:
+                text = name
+            else:
+                text = f"{name} ({score}%)"
+            self.cmb_single_suggestion.addItem(text)
+            idx = self.cmb_single_suggestion.count() - 1
+            self.cmb_single_suggestion.setItemData(idx, name, Qt.UserRole)
+
+        if current:
+            for idx in range(self.cmb_single_suggestion.count()):
+                if self.cmb_single_suggestion.itemData(idx, Qt.UserRole) == current:
+                    self.cmb_single_suggestion.setCurrentIndex(idx)
+                    break
+
+        self.cmb_single_suggestion.blockSignals(False)
+
+        visible = self.rb_single_batch.isChecked() and self.cmb_single_suggestion.count() > 0
+        self.lbl_single_suggestion.setVisible(visible)
+        self.cmb_single_suggestion.setVisible(visible)
+        self.btn_use_single_suggestion.setVisible(visible)
+        self.btn_use_single_suggestion.setEnabled(visible)
+
+    def _on_single_suggestion_changed(self, index: int):
+        if index < 0:
+            return
+        if not self.rb_single_batch.isChecked():
+            return
+        self._apply_selected_single_suggestion()
+
+    def _on_use_single_suggestion(self):
+        self._apply_selected_single_suggestion()
+
+    def _apply_selected_single_suggestion(self):
+        if not self.rb_single_batch.isChecked():
+            return
+        suggestion = self.cmb_single_suggestion.currentData(Qt.UserRole)
+        suggestion = str(suggestion).strip() if suggestion else ""
+        if suggestion:
+            self.txt_search.setText(suggestion)
+            self.txt_manual_name.setText(suggestion)
+            self._log(f"Sugerencia aplicada: <b>{suggestion}</b>")
+
+    def _single_mode_guess(self) -> str:
+        """Pick the best single-series suggestion using detected file-based groups."""
+        selected = self.cmb_single_suggestion.currentData(Qt.UserRole)
+        selected = str(selected).strip() if selected else ""
+        if selected:
+            return selected
+
+        if self.episode_groups:
+            best_key = max(
+                self.episode_groups,
+                key=lambda key: (len(self.episode_groups[key]), self.group_labels.get(key, "").lower()),
+            )
+            return self.group_labels.get(best_key, "")
+
+        if self.source_folder:
+            return guess_series_name_from_path(self.source_folder)
+        return ""
+
+    def _apply_single_mode_suggestion(self):
+        if not self.rb_single_batch.isChecked():
+            return
+        if not self.single_mode_suggestions:
+            self._build_single_mode_suggestions()
+
+        guess = self._single_mode_guess().strip()
+        if guess:
+            self.txt_search.setText(guess)
+            self.txt_manual_name.setText(guess)
+
+        if self.episode_groups and len(self.episode_groups) > 1:
+            suggestions = ", ".join(
+                f"{self.group_labels.get(key, key)} ({len(self.episode_groups[key])})"
+                for key in self.episode_groups
+            )
+            self._log(
+                "Sugerencias por nombre de fichero (modo único): "
+                f"<b>{suggestions}</b>"
+            )
+
+    def _refresh_group_selector(self, keep_current: bool = False):
+        was_key = self.active_group_key if keep_current else None
+        self.cmb_series_group.blockSignals(True)
+        self.cmb_series_group.clear()
+
+        for key, episodes in self.episode_groups.items():
+            label = self.group_labels.get(key, "Serie")
+            assignment_type = self.series_assignment_type.get(key, "")
+            if assignment_type == "online":
+                assigned = " ✓"
+            elif assignment_type == "manual":
+                assigned = " ~"
+            else:
+                assigned = ""
+            self.cmb_series_group.addItem(f"{label} ({len(episodes)}){assigned}", key)
+
+            # Apply a soft per-item color status in the dropdown.
+            idx = self.cmb_series_group.count() - 1
+            if assignment_type == "online":
+                self.cmb_series_group.setItemData(idx, QColor("#a6e3a1"), Qt.ForegroundRole)
+                self.cmb_series_group.setItemData(idx, QColor("#1e2a20"), Qt.BackgroundRole)
+            elif assignment_type == "manual":
+                self.cmb_series_group.setItemData(idx, QColor("#f9e2af"), Qt.ForegroundRole)
+                self.cmb_series_group.setItemData(idx, QColor("#2d2618"), Qt.BackgroundRole)
+            else:
+                self.cmb_series_group.setItemData(idx, QColor("#cdd6f4"), Qt.ForegroundRole)
+                self.cmb_series_group.setItemData(idx, QColor("#1e1e2e"), Qt.BackgroundRole)
+
+        if was_key and was_key in self.episode_groups:
+            idx = self.cmb_series_group.findData(was_key)
+            if idx >= 0:
+                self.cmb_series_group.setCurrentIndex(idx)
+                self.active_group_key = was_key
+        elif self.cmb_series_group.count() > 0:
+            self.cmb_series_group.setCurrentIndex(0)
+            self.active_group_key = self.cmb_series_group.currentData()
+
+        self.cmb_series_group.blockSignals(False)
+        visible = self.rb_multi_batch.isChecked() and bool(self.episode_groups)
+        self.lbl_series_group.setVisible(visible)
+        self.cmb_series_group.setVisible(visible)
+        self.btn_next_unassigned.setVisible(visible)
+        self.lbl_group_summary.setVisible(visible)
+
+        online_count, manual_count, provisional_count, pending_count = self._assignment_counts()
+        self.btn_next_unassigned.setEnabled(bool(self._next_unassigned_group_key()))
+        self.btn_next_unassigned.setText(f"Siguiente sin confirmar ({pending_count})")
+        self.lbl_group_summary.setText(
+            f"Online: {online_count} | Manual: {manual_count} | Pendientes: {provisional_count}"
+        )
+
+    def _assignment_counts(self) -> tuple[int, int, int, int]:
+        online_count = 0
+        manual_count = 0
+        provisional_count = 0
+
+        for key in self.episode_groups.keys():
+            assignment_type = self.series_assignment_type.get(key, "")
+            if assignment_type == "online":
+                online_count += 1
+            elif assignment_type == "manual":
+                manual_count += 1
+            else:
+                provisional_count += 1
+
+        pending_count = provisional_count + manual_count
+        return online_count, manual_count, provisional_count, pending_count
+
+    def _next_unassigned_group_key(self) -> Optional[str]:
+        for key in self.episode_groups.keys():
+            if self.series_assignment_type.get(key) != "online":
+                return key
+        return None
+
+    def _on_next_unassigned_group(self):
+        key = self._next_unassigned_group_key()
+        if not key:
+            QMessageBox.information(self, "Todo confirmado", "Todos los grupos están confirmados online.")
+            return
+
+        idx = self.cmb_series_group.findData(key)
+        if idx >= 0:
+            self.cmb_series_group.setCurrentIndex(idx)
+            label = self.group_labels.get(key, key)
+            self._log(f"Grupo pendiente seleccionado: <b>{label}</b>")
+
+    def _sync_inputs_with_active_group(self):
+        if not self.rb_multi_batch.isChecked():
+            return
+        if not self.active_group_key:
+            return
+        label = self.group_labels.get(self.active_group_key, "")
+        if label:
+            self.txt_search.setText(label)
+            self.txt_manual_name.setText(label)
+
+    def _episodes_for_current_context(self) -> List[EpisodeFile]:
+        if not self.rb_multi_batch.isChecked():
+            return self.episodes
+        if not self.active_group_key:
+            return []
+        return self.episode_groups.get(self.active_group_key, [])
+
+    def _on_series_group_changed(self, index: int):
+        if index < 0:
+            return
+        key = self.cmb_series_group.itemData(index)
+        self.active_group_key = key
+        self._sync_inputs_with_active_group()
+
+        assigned = self.series_assignments.get(key)
+        assignment_type = self.series_assignment_type.get(key, "provisional")
+
+        if assigned and assignment_type == "online":
+            self.selected_series = assigned
+            year = assigned.first_air_date[:4] if assigned.first_air_date else "?"
+            self.lbl_series_info.setText(f"<b>{assigned.name}</b> ({year})")
+            self.info_frame.setVisible(True)
+            self._load_poster(assigned.poster_url)
+            self.statusBar().showMessage("Grupo confirmado online")
+        else:
+            self.selected_series = None
+            self.lbl_series_info.setText("")
+            self.lbl_poster.clear()
+            self.lbl_poster.setText("")
+            self.info_frame.setVisible(False)
+            if assignment_type == "manual":
+                self.statusBar().showMessage("Grupo asignado manualmente (pendiente de confirmar online)")
+            else:
+                self.statusBar().showMessage("Grupo pendiente de confirmar online")
+
     def _on_apply_manual(self):
         """Apply a manually entered series name."""
         name = self.txt_manual_name.text().strip()
@@ -411,13 +789,24 @@ class MainWindow(QMainWindow):
             return
 
         # Create a minimal TMDBSeries with just the name (no episode titles)
-        self.selected_series = TMDBSeries(
+        chosen_series = TMDBSeries(
             tmdb_id=0,
             name=name,
         )
+        self.selected_series = chosen_series
+
+        if self.rb_multi_batch.isChecked() and self.active_group_key:
+            self.series_assignments[self.active_group_key] = chosen_series
+            self.series_assignment_type[self.active_group_key] = "manual"
+            self._refresh_group_selector(keep_current=True)
+
         self.lbl_series_info.setText("")
         self.btn_preview.setEnabled(True)
-        self._log(f"Nombre manual aplicado: <b>{name}</b>")
+        if self.rb_multi_batch.isChecked() and self.active_group_key:
+            group_label = self.group_labels.get(self.active_group_key, self.active_group_key)
+            self._log(f"Nombre manual aplicado al grupo <b>{group_label}</b>: <b>{name}</b>")
+        else:
+            self._log(f"Nombre manual aplicado: <b>{name}</b>")
         self.statusBar().showMessage(f"Serie: {name} (manual)")
 
         # Auto-preview if we already have scanned episodes
@@ -467,6 +856,31 @@ class MainWindow(QMainWindow):
 
     def _on_scan_finished(self, episodes: List[EpisodeFile]):
         self.episodes = episodes
+        self.series_assignments = {}
+        self.series_assignment_type = {}
+        self.selected_series = None
+        self._pending_assignment_group = None
+        self._build_episode_groups()
+        self._maybe_prompt_batch_mode_switch()
+        self._refresh_group_selector()
+        if self.rb_multi_batch.isChecked():
+            self._sync_inputs_with_active_group()
+        else:
+            self._apply_single_mode_suggestion()
+
+        # Build provisional assignments so preview is always available right after scan.
+        if self.rb_multi_batch.isChecked():
+            for key, label in self.group_labels.items():
+                self.series_assignments[key] = TMDBSeries(tmdb_id=0, name=label)
+                self.series_assignment_type[key] = "provisional"
+            self._refresh_group_selector(keep_current=True)
+        else:
+            guess = self._single_mode_guess().strip()
+            if guess:
+                self.selected_series = TMDBSeries(tmdb_id=0, name=guess)
+
+        self.btn_preview.setEnabled(bool(self.episodes))
+
         self._update_table()
         self.btn_scan.setEnabled(True)
 
@@ -480,6 +894,27 @@ class MainWindow(QMainWindow):
         summary = ", ".join(status_parts) if status_parts else "0 archivos"
         self.statusBar().showMessage(f"Encontrados: {summary}")
         self._log(f"Escaneados: {summary}")
+
+        if self.episode_groups:
+            detected = ", ".join(
+                f"{self.group_labels[key]} ({len(self.episode_groups[key])})"
+                for key in self.episode_groups
+            )
+            self._log(f"Series detectadas por afinidad: <b>{detected}</b>")
+
+            if self.rb_multi_batch.isChecked():
+                self._log(
+                    "Asignación provisional aplicada en modo múltiple. "
+                    "Puedes previsualizar ya y luego confirmar online cada grupo."
+                )
+                self._log("Leyenda grupos: <b>✓</b> online, <b>~</b> manual, sin marca = provisional")
+            else:
+                selected_name = self.selected_series.name if self.selected_series else ""
+                if selected_name:
+                    self._log(
+                        "Asignación provisional aplicada en modo único: "
+                        f"<b>{selected_name}</b>"
+                    )
 
         if not episodes:
             QMessageBox.information(
@@ -513,6 +948,43 @@ class MainWindow(QMainWindow):
         self.btn_scan.setEnabled(True)
         self._log_error(msg)
         self.statusBar().showMessage("Error al escanear")
+
+    def _maybe_prompt_batch_mode_switch(self):
+        """Suggest switching batch mode when scan results strongly indicate the opposite mode."""
+        group_count = len(self.episode_groups)
+        if group_count == 0:
+            return
+
+        is_multi_selected = self.rb_multi_batch.isChecked()
+
+        # Multiple detected groups strongly suggests multi-series mode.
+        if not is_multi_selected and group_count > 1:
+            reply = QMessageBox.question(
+                self,
+                "Tipo de lote detectado",
+                "MediaClean detectó varias series probables en la carpeta escaneada.\n\n"
+                "¿Quieres cambiar automáticamente a 'Múltiples series'?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply == QMessageBox.Yes:
+                self.rb_multi_batch.setChecked(True)
+                self._log("Cambio automático de tipo de lote: <b>Múltiples series</b>")
+            return
+
+        # A single detected group suggests single-series mode.
+        if is_multi_selected and group_count == 1:
+            reply = QMessageBox.question(
+                self,
+                "Tipo de lote detectado",
+                "MediaClean detectó una sola serie probable en la carpeta escaneada.\n\n"
+                "¿Quieres cambiar automáticamente a 'Serie única'?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply == QMessageBox.Yes:
+                self.rb_single_batch.setChecked(True)
+                self._log("Cambio automático de tipo de lote: <b>Serie única</b>")
 
     def _on_provider_changed(self, index: int):
         """Toggle UI elements based on selected API provider."""
@@ -626,28 +1098,49 @@ class MainWindow(QMainWindow):
         self._log_error(f"{provider}: {msg}")
         self.statusBar().showMessage(f"Error en búsqueda {provider}")
 
+    def _find_series_by_id(self, tmdb_id: int) -> Optional[TMDBSeries]:
+        for s in self.tmdb_results:
+            if s.tmdb_id == tmdb_id:
+                return s
+        return None
+
+    def _show_search_series_preview(self, series: TMDBSeries):
+        year = series.first_air_date[:4] if series.first_air_date else "?"
+        overview = series.overview
+        overview_text = f"<br><i>{overview[:200]}{'…' if len(overview) > 200 else ''}</i>" if overview else ""
+        self.lbl_series_info.setText(
+            f"<b>{series.name}</b> ({year}){overview_text}"
+        )
+        self.info_frame.setVisible(True)
+        self._load_poster(series.poster_url)
+
+    def _on_series_hovered(self, item: QListWidgetItem):
+        tmdb_id = item.data(Qt.UserRole)
+        hovered = self._find_series_by_id(tmdb_id)
+        if not hovered:
+            return
+        self._show_search_series_preview(hovered)
+        provider = self.cmb_provider.currentText()
+        self.statusBar().showMessage(f"Previsualizando resultado en {provider} (clic para asignar)")
+
     def _on_series_selected(self, item: QListWidgetItem):
         tmdb_id = item.data(Qt.UserRole)
         # Find the series object
-        self.selected_series = None
-        for s in self.tmdb_results:
-            if s.tmdb_id == tmdb_id:
-                self.selected_series = s
-                break
+        self.selected_series = self._find_series_by_id(tmdb_id)
 
         if not self.selected_series:
             return
 
-        year = self.selected_series.first_air_date[:4] if self.selected_series.first_air_date else "?"
-        overview = self.selected_series.overview
-        overview_text = f"<br><i>{overview[:200]}{'…' if len(overview) > 200 else ''}</i>" if overview else ""
-        self.lbl_series_info.setText(
-            f"<b>{self.selected_series.name}</b> ({year}){overview_text}"
-        )
-        self.info_frame.setVisible(True)
+        if self.rb_multi_batch.isChecked():
+            if not self.active_group_key:
+                QMessageBox.information(self, "Grupo no seleccionado", "Selecciona un grupo de serie primero.")
+                return
+            self._pending_assignment_group = self.active_group_key
+        else:
+            self._pending_assignment_group = None
 
-        # Load poster thumbnail
-        self._load_poster(self.selected_series.poster_url)
+        # Keep the same preview behavior when assigning via click.
+        self._show_search_series_preview(self.selected_series)
 
         # Now load episodes
         if not self._ensure_tmdb_client():
@@ -659,7 +1152,7 @@ class MainWindow(QMainWindow):
         # Determine which seasons we need
         seasons_needed = set()
         requested_episodes = {}
-        for ep in self.episodes:
+        for ep in self._episodes_for_current_context():
             if ep.season is not None:
                 seasons_needed.add(ep.season)
                 if ep.episode is not None:
@@ -687,6 +1180,22 @@ class MainWindow(QMainWindow):
 
     def _on_episodes_loaded(self, series: TMDBSeries):
         self.selected_series = series
+        if self.rb_multi_batch.isChecked() and self._pending_assignment_group:
+            self.series_assignments[self._pending_assignment_group] = series
+            self.series_assignment_type[self._pending_assignment_group] = "online"
+            group_label = self.group_labels.get(self._pending_assignment_group, self._pending_assignment_group)
+            self._log_success(f"Asignada '{series.name}' al grupo '{group_label}'")
+            self._refresh_group_selector(keep_current=True)
+
+            next_key = self._next_unassigned_group_key()
+            if next_key:
+                next_idx = self.cmb_series_group.findData(next_key)
+                if next_idx >= 0:
+                    self.cmb_series_group.setCurrentIndex(next_idx)
+                    next_label = self.group_labels.get(next_key, next_key)
+                    self._log(f"Siguiente pendiente: <b>{next_label}</b>")
+        self._pending_assignment_group = None
+
         self.btn_preview.setEnabled(True)
         n = len(series.episodes)
         provider = self.cmb_provider.currentText()
@@ -725,22 +1234,42 @@ class MainWindow(QMainWindow):
 
     def _load_poster(self, url: str):
         """Download and display the series poster thumbnail."""
-        self.lbl_poster.clear()
         if not url:
+            self._last_poster_url = ""
+            self.lbl_poster.clear()
             self.lbl_poster.setText("")
             return
 
+        thumb_url = self._thumbnail_url(url)
+        if thumb_url == self._last_poster_url and self.lbl_poster.pixmap() is not None:
+            return
+
+        self._last_poster_url = thumb_url
+        self._poster_request_seq += 1
+        request_seq = self._poster_request_seq
         self.lbl_poster.setText("⏳")
 
-        thumb_url = self._thumbnail_url(url)
         from mediaclean.ui.workers import PosterWorker
-        self._poster_worker = PosterWorker(thumb_url)
-        self._poster_worker.finished.connect(self._on_poster_loaded)
-        self._poster_worker.error.connect(self._on_poster_error)
-        self._poster_worker.start()
+        worker = PosterWorker(thumb_url)
+        self._poster_worker = worker
+        self._active_poster_workers.append(worker)
+        worker.finished.connect(lambda data, w=worker, seq=request_seq: self._on_poster_loaded(data, seq, w))
+        worker.error.connect(lambda msg, w=worker, seq=request_seq: self._on_poster_error(msg, seq, w))
+        worker.start()
 
-    def _on_poster_loaded(self, image_data: bytes):
+    def _release_poster_worker(self, worker):
+        try:
+            if worker in self._active_poster_workers:
+                self._active_poster_workers.remove(worker)
+        except Exception:
+            pass
+
+    def _on_poster_loaded(self, image_data: bytes, request_seq: int, worker):
         """Display the downloaded poster thumbnail."""
+        self._release_poster_worker(worker)
+        if request_seq != self._poster_request_seq:
+            return
+
         pixmap = QPixmap()
         pixmap.loadFromData(image_data)
         if pixmap.isNull():
@@ -753,8 +1282,13 @@ class MainWindow(QMainWindow):
         )
         self.lbl_poster.setPixmap(scaled)
 
-    def _on_poster_error(self, msg: str):
-        self.lbl_poster.setText("")
+    def _on_poster_error(self, msg: str, request_seq: int, worker):
+        self._release_poster_worker(worker)
+        if request_seq != self._poster_request_seq:
+            return
+        # Keep the last visible image if we had one; avoid flashing blank on transient failures.
+        if self.lbl_poster.pixmap() is None:
+            self.lbl_poster.setText("")
 
     def _on_preview(self):
         if not self.episodes:
@@ -764,28 +1298,79 @@ class MainWindow(QMainWindow):
             )
             return
 
+        if self.rb_multi_batch.isChecked():
+            if not self.episode_groups:
+                QMessageBox.information(self, "Sin grupos", "Escanea una carpeta primero.")
+                return
+
+            output_base = self._get_output_path()
+            for ep in self.episodes:
+                ep.new_name = None
+                ep.new_path = None
+
+            missing_groups = []
+            for key, group_episodes in self.episode_groups.items():
+                assigned_series = self.series_assignments.get(key)
+                if not assigned_series:
+                    missing_groups.append(self.group_labels.get(key, key))
+                    continue
+                plan_renames(group_episodes, assigned_series, output_base)
+
+            self._update_table()
+
+            if missing_groups:
+                self.btn_execute.setEnabled(False)
+                missing_text = ", ".join(missing_groups)
+                self._log_error(f"Faltan asignaciones de serie para: {missing_text}")
+                self._on_next_unassigned_group()
+                QMessageBox.information(
+                    self,
+                    "Asignaciones incompletas",
+                    "Debes asignar una serie a cada grupo detectado antes de ejecutar.\n\n"
+                    "Usa 'Siguiente sin asignar' para saltar al siguiente grupo pendiente."
+                )
+                self.statusBar().showMessage("Previsualización parcial (faltan asignaciones)")
+                return
+
+            duplicate_targets, existing_targets = self._detect_plan_conflicts()
+            if duplicate_targets or existing_targets:
+                self.btn_execute.setEnabled(False)
+                self._show_conflict_summary(duplicate_targets, existing_targets)
+                self.statusBar().showMessage("Previsualización con conflictos")
+                return
+
+            self.btn_execute.setEnabled(True)
+            self._log("Previsualización multi-serie generada. Puedes ejecutar cuando quieras.")
+            self.statusBar().showMessage("Previsualización multi-serie lista")
+            return
+
         if not self.selected_series:
-            # If in manual mode, try to apply the name automatically
-            if self.rb_manual.isChecked():
-                name = self.txt_manual_name.text().strip()
-                if name:
-                    self.selected_series = TMDBSeries(tmdb_id=0, name=name)
-                else:
-                    QMessageBox.information(
-                        self, "Faltan datos",
-                        "Escribe el nombre de la serie en el campo manual."
-                    )
-                    return
+            # Fallback: always try a local/manual suggestion so preview can proceed.
+            name = self.txt_manual_name.text().strip() or self.txt_search.text().strip() or self._single_mode_guess().strip()
+            if name:
+                self.selected_series = TMDBSeries(tmdb_id=0, name=name)
+                self._log(
+                    "Previsualización con asignación provisional. "
+                    f"Serie usada: <b>{name}</b>"
+                )
             else:
                 QMessageBox.information(
                     self, "Faltan datos",
-                    "Selecciona una serie online o cambia a modo manual."
+                    "Selecciona una serie online o escribe un nombre manual para previsualizar."
                 )
                 return
 
         output_base = self._get_output_path()
         plan_renames(self.episodes, self.selected_series, output_base)
         self._update_table()
+
+        duplicate_targets, existing_targets = self._detect_plan_conflicts()
+        if duplicate_targets or existing_targets:
+            self.btn_execute.setEnabled(False)
+            self._show_conflict_summary(duplicate_targets, existing_targets)
+            self.statusBar().showMessage("Previsualización con conflictos")
+            return
+
         self.btn_execute.setEnabled(True)
         self._log("Previsualización generada. Revisa los nombres y pulsa 'Ejecutar' para procesar los archivos.")
         self.statusBar().showMessage("Previsualización lista")
@@ -794,6 +1379,17 @@ class MainWindow(QMainWindow):
         planned = [e for e in self.episodes if e.new_path]
         if not planned:
             QMessageBox.warning(self, "Nada que hacer", "No hay archivos para procesar.")
+            return
+
+        duplicate_targets, existing_targets = self._detect_plan_conflicts()
+        if duplicate_targets or existing_targets:
+            self._show_conflict_summary(duplicate_targets, existing_targets)
+            self.btn_execute.setEnabled(False)
+            self.statusBar().showMessage("Ejecución bloqueada por conflictos")
+            return
+
+        if self.chk_dry_run.isChecked():
+            self._run_dry_run(planned)
             return
 
         is_move = self.rb_move.isChecked()
@@ -836,6 +1432,188 @@ class MainWindow(QMainWindow):
         self._rename_worker.error.connect(self._on_execute_error)
         self._rename_worker.start()
 
+    def _run_dry_run(self, planned: List[EpisodeFile]):
+        """Strict simulation mode: validate and show the final plan without touching files."""
+        op = "MOVE" if self.rb_move.isChecked() else "COPY"
+        self._log("Simulación (dry-run) iniciada. No se modificará ningún archivo.")
+        for ep in planned:
+            src_name = ep.original_path.name
+            dst_name = ep.new_name or ""
+            self._log(f"DRY-RUN {op}: {src_name}  -->  {dst_name}")
+
+        self._log_success(f"Simulación completada: {len(planned)} archivo(s) planificado(s), 0 cambios reales.")
+
+        if self.chk_export_report.isChecked():
+            report_path = self._export_report_csv(mode="dry-run", logs=[])
+            if report_path:
+                self._log_success(f"Reporte CSV generado: {report_path}")
+
+        self.statusBar().showMessage("Simulación completada")
+        QMessageBox.information(
+            self,
+            "Simulación completada",
+            "Dry-run completado correctamente.\n\n"
+            "No se ha copiado ni movido ningún archivo."
+        )
+
+    def _episode_source_desc(self, ep: EpisodeFile) -> str:
+        source_desc = ep.original_path.name
+        if ep.archive_member:
+            source_desc = f"{source_desc}:{Path(ep.archive_member).name}"
+        return source_desc
+
+    def _build_status_map_from_logs(self, logs: List[str]) -> Dict[str, Dict[str, str]]:
+        status_map: Dict[str, Dict[str, str]] = {}
+        prefixes = ("MOVE:", "COPY:", "EXTRACT:", "ERROR:", "SKIP:")
+
+        for raw in logs:
+            msg = str(raw).strip()
+            if not msg.startswith(prefixes):
+                continue
+
+            if "-->" in msg:
+                left, right = msg.split("-->", 1)
+            else:
+                left, right = msg, ""
+
+            if left.startswith("MOVE:"):
+                status = "OK"
+                source = left[len("MOVE:"):].strip()
+            elif left.startswith("COPY:"):
+                status = "OK"
+                source = left[len("COPY:"):].strip()
+            elif left.startswith("EXTRACT:"):
+                status = "OK"
+                source = left[len("EXTRACT:"):].strip()
+            elif left.startswith("ERROR:"):
+                status = "ERROR"
+                source = left[len("ERROR:"):].strip()
+            else:
+                status = "SKIP"
+                source = left[len("SKIP:"):].strip()
+
+            status_map[source] = {
+                "status": status,
+                "message": right.strip() if right.strip() else msg,
+            }
+
+        return status_map
+
+    def _export_report_csv(self, mode: str, logs: List[str]) -> Optional[Path]:
+        try:
+            output_base = self._get_output_path()
+            output_base.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            report_path = output_base / f"MediaClean_report_{mode}_{timestamp}.csv"
+
+            status_map = self._build_status_map_from_logs(logs)
+
+            with report_path.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                writer.writerow([
+                    "timestamp",
+                    "mode",
+                    "status",
+                    "source_path",
+                    "source_desc",
+                    "series_guess",
+                    "assigned_series",
+                    "season",
+                    "episode",
+                    "new_name",
+                    "target_path",
+                    "message",
+                ])
+
+                now_iso = datetime.now().isoformat(timespec="seconds")
+                for ep in self.episodes:
+                    source_desc = self._episode_source_desc(ep)
+                    assigned_series = self._assigned_series_for_episode(ep)
+                    assigned_name = assigned_series.name if assigned_series else ""
+
+                    if mode == "dry-run":
+                        status = "DRY-RUN" if ep.new_path else "SKIP"
+                        message = "Planned only" if ep.new_path else "No season/episode info"
+                    else:
+                        row_state = status_map.get(source_desc)
+                        if row_state:
+                            status = row_state.get("status", "UNKNOWN")
+                            message = row_state.get("message", "")
+                        elif ep.new_path is None:
+                            status = "SKIP"
+                            message = "No season/episode info"
+                        else:
+                            status = "UNKNOWN"
+                            message = "No explicit worker log entry"
+
+                    writer.writerow([
+                        now_iso,
+                        mode,
+                        status,
+                        str(ep.original_path),
+                        source_desc,
+                        ep.series_guess,
+                        assigned_name,
+                        ep.season if ep.season is not None else "",
+                        ep.episode if ep.episode is not None else "",
+                        ep.new_name or "",
+                        str(ep.new_path) if ep.new_path else "",
+                        message,
+                    ])
+
+            return report_path
+        except Exception as exc:
+            self._log_error(f"No se pudo exportar el reporte CSV: {exc}")
+            return None
+
+    def _detect_plan_conflicts(self) -> tuple[list[Path], list[Path]]:
+        """Return duplicate target paths and already-existing target paths."""
+        planned_paths = [ep.new_path for ep in self.episodes if ep.new_path is not None]
+        seen: dict[Path, int] = {}
+        duplicates: list[Path] = []
+
+        for path in planned_paths:
+            seen[path] = seen.get(path, 0) + 1
+
+        for path, count in seen.items():
+            if count > 1:
+                duplicates.append(path)
+
+        existing = [path for path in planned_paths if path.exists()]
+        duplicates.sort(key=lambda p: str(p).lower())
+        existing.sort(key=lambda p: str(p).lower())
+        return duplicates, existing
+
+    def _show_conflict_summary(self, duplicate_targets: List[Path], existing_targets: List[Path]):
+        """Show and log destination conflicts found in the current plan."""
+        if duplicate_targets:
+            self._log_error(
+                f"Conflicto: {len(duplicate_targets)} destino(s) duplicado(s) en el plan."
+            )
+            for path in duplicate_targets[:8]:
+                self._log_error(f"  DUPLICADO: {path}")
+
+        if existing_targets:
+            self._log_error(
+                f"Conflicto: {len(existing_targets)} destino(s) ya existen en disco."
+            )
+            for path in existing_targets[:8]:
+                self._log_error(f"  EXISTE: {path}")
+
+        details = []
+        if duplicate_targets:
+            details.append(f"- Destinos duplicados en el plan: {len(duplicate_targets)}")
+        if existing_targets:
+            details.append(f"- Destinos ya existentes: {len(existing_targets)}")
+
+        QMessageBox.warning(
+            self,
+            "Conflictos detectados",
+            "Se detectaron conflictos en la previsualización y se bloqueó la ejecución.\n\n"
+            + "\n".join(details)
+            + "\n\nRevisa la tabla y/o ajusta temporada/episodio antes de continuar."
+        )
+
     def _on_progress(self, current: int, total: int):
         self.progress_bar.setValue(current)
 
@@ -861,6 +1639,11 @@ class MainWindow(QMainWindow):
         self.btn_scan.setEnabled(True)
         self.btn_preview.setEnabled(True)
         self._rename_worker = None
+
+        if self.chk_export_report.isChecked():
+            report_path = self._export_report_csv(mode="execute", logs=logs)
+            if report_path:
+                self._log_success(f"Reporte CSV generado: {report_path}")
 
         if error_count:
             self.statusBar().showMessage(f"Proceso completado con {error_count} error(es)")
@@ -905,7 +1688,7 @@ class MainWindow(QMainWindow):
         self._log(f"Temporada forzada a <b>{new_season}</b> para todos los episodios")
         self.statusBar().showMessage(f"Temporada forzada: {new_season}")
         # Re-run preview if we have a series selected
-        if self.selected_series:
+        if self.selected_series or (self.rb_multi_batch.isChecked() and self.series_assignments):
             self._on_preview()
 
     def _on_cell_changed(self, row: int, col: int):
@@ -944,7 +1727,7 @@ class MainWindow(QMainWindow):
         ep.new_name = None
         ep.new_path = None
         self.table.blockSignals(True)
-        self.table.setItem(row, 4, QTableWidgetItem(""))
+        self.table.setItem(row, 5, QTableWidgetItem(""))
         self.table.blockSignals(False)
 
     def _get_output_path(self) -> Path:
@@ -955,7 +1738,27 @@ class MainWindow(QMainWindow):
             return self.source_folder.parent / DEFAULT_OUTPUT_FOLDER
         return Path.home() / DEFAULT_OUTPUT_FOLDER
 
+    def _assigned_series_for_episode(self, ep: EpisodeFile) -> Optional[TMDBSeries]:
+        if self.rb_multi_batch.isChecked():
+            group_key = self._group_key(ep.series_guess or "")
+            return self.series_assignments.get(group_key)
+        return self.selected_series
+
+    def _series_label_for_episode(self, ep: EpisodeFile) -> str:
+        assigned = self._assigned_series_for_episode(ep)
+        if assigned and assigned.name:
+            return assigned.name
+        fallback = (ep.series_guess or "Serie desconocida").strip()
+        return fallback or "Serie desconocida"
+
+    def _episode_sort_key(self, ep: EpisodeFile) -> tuple:
+        series_name = self._series_label_for_episode(ep).lower()
+        season = ep.season if ep.season is not None else 10_000
+        episode = ep.episode if ep.episode is not None else 10_000
+        return (series_name, season, episode, ep.original_path.name.lower())
+
     def _update_table(self):
+        self.episodes.sort(key=self._episode_sort_key)
         self.table.blockSignals(True)  # Prevent cellChanged during population
         self.table.setRowCount(len(self.episodes))
         for row, ep in enumerate(self.episodes):
@@ -986,24 +1789,32 @@ class MainWindow(QMainWindow):
             item_e.setTextAlignment(Qt.AlignCenter)
             self.table.setItem(row, 2, item_e)
 
-            # TMDB episode name (read-only)
+            # Episode title from assigned series metadata (read-only)
             tmdb_name = ""
-            if self.selected_series and ep.season is not None and ep.episode is not None:
-                tmdb_ep = self.selected_series.get_episode(ep.season, ep.episode)
+            assigned_series = self._assigned_series_for_episode(ep)
+            if assigned_series and ep.season is not None and ep.episode is not None:
+                tmdb_ep = assigned_series.get_episode(ep.season, ep.episode)
                 if tmdb_ep:
                     tmdb_name = tmdb_ep.name
             item_tmdb = QTableWidgetItem(tmdb_name)
             item_tmdb.setFlags(item_tmdb.flags() & ~Qt.ItemIsEditable)
             self.table.setItem(row, 3, item_tmdb)
 
+            assigned_name = assigned_series.name if assigned_series else ""
+            if self.rb_multi_batch.isChecked() and not assigned_name:
+                assigned_name = self.group_labels.get(self._group_key(ep.series_guess or ""), ep.series_guess or "Serie desconocida")
+            item_assigned = QTableWidgetItem(assigned_name)
+            item_assigned.setFlags(item_assigned.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(row, 4, item_assigned)
+
             # New filename (read-only)
             new_name = ep.new_name if ep.new_name else ""
             item_new = QTableWidgetItem(new_name)
             item_new.setFlags(item_new.flags() & ~Qt.ItemIsEditable)
-            self.table.setItem(row, 4, item_new)
+            self.table.setItem(row, 5, item_new)
 
         self.table.blockSignals(False)
         self.table.resizeColumnsToContents()
         # Re-stretch first and last columns
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)

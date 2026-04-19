@@ -167,6 +167,7 @@ class OMDBClient:
         self,
         series: TMDBSeries,
         seasons: Optional[List[int]] = None,
+        requested_episodes: Optional[Dict[int, List[int]]] = None,
     ):
         """
         Load episode metadata for the given seasons into the series
@@ -182,9 +183,20 @@ class OMDBClient:
             series.seasons_count = details.seasons_count
             seasons = list(range(1, details.seasons_count + 1))
 
+        requested_episode_map: Dict[int, List[int]] = {}
+        if requested_episodes:
+            for season_number, episode_numbers in requested_episodes.items():
+                clean_numbers = sorted({n for n in episode_numbers if isinstance(n, int) and n > 0})
+                if clean_numbers:
+                    requested_episode_map[season_number] = clean_numbers
+
         for s in seasons:
             try:
                 eps = self.get_season_episodes(series.tmdb_id, s)
+                requested_for_season = requested_episode_map.get(s)
+                if requested_for_season:
+                    requested_set = set(requested_for_season)
+                    eps = [ep for ep in eps if ep.episode in requested_set]
                 for ep in eps:
                     key = f"S{ep.season:02d}E{ep.episode:02d}"
                     series.episodes[key] = ep
